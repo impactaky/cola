@@ -1,0 +1,500 @@
+#!/usr/bin/env -S deno run --allow-run=codex,ps --allow-read --allow-env --allow-net=127.0.0.1,localhost
+
+import { Command, EnumType } from "@cliffy/command";
+
+type JsonRpcId = number | string;
+
+type JsonRpcRequest = {
+  id?: JsonRpcId;
+  method: string;
+  params?: Record<string, unknown>;
+};
+
+type JsonRpcResponse = {
+  id?: JsonRpcId;
+  result?: unknown;
+  error?: {
+    code?: number;
+    message?: string;
+    data?: unknown;
+  };
+};
+
+type ThreadSummary = {
+  id?: string;
+  preview?: string;
+  modelProvider?: string;
+  createdAt?: number;
+  updatedAt?: number;
+};
+
+type TurnSummary = {
+  id?: string;
+  status?: unknown;
+};
+
+type CreateOptions = {
+  codexCommand: string;
+  connect?: string;
+  cwd: string;
+  model?: string;
+  approvalPolicy?: string;
+  sandbox?: string;
+  personality?: string;
+  message?: string;
+  timeoutMs: number;
+  json: boolean;
+};
+
+type RawCreateOptions = Record<string, unknown>;
+
+const DEFAULT_CODEX_COMMAND = "codex";
+const DEFAULT_TIMEOUT_MS = 15_000;
+
+const CLIENT_INFO = {
+  name: "cxs",
+  title: "Codex Session CLI",
+  version: "0.1.0",
+};
+
+class AppServerClient {
+  #command: string;
+  #process?: Deno.ChildProcess;
+  #stdin?: WritableStreamDefaultWriter<Uint8Array>;
+  #stdout?: ReadableStreamDefaultReader<Uint8Array>;
+  #stderrReader?: ReadableStreamDefaultReader<Uint8Array>;
+  #ws?: WebSocket;
+  #wsMessages: unknown[] = [];
+  #wsWaiters: Array<(value: unknown | undefined) => void> = [];
+  #stderr = "";
+  #buffer = "";
+  #nextId = 1;
+  #decoder = new TextDecoder();
+  #encoder = new TextEncoder();
+
+  constructor(command: string, connect?: string) {
+    this.#command = command;
+    if (connect) this.#connectUrl = connect;
+  }
+
+  #connectUrl?: string;
+
+  async start() {
+    if (this.#connectUrl) {
+      await this.#connectWebSocket(this.#connectUrl);
+      return;
+    }
+
+    const child = new Deno.Command(this.#command, {
+      args: ["app-server"],
+      stdin: "piped",
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+
+    this.#process = child;
+    this.#stdin = child.stdin.getWriter();
+    this.#stdout = child.stdout.getReader();
+    this.#collectStderr(child.stderr);
+  }
+
+  async initialize(timeoutMs: number) {
+    await this.request("initialize", {
+      clientInfo: CLIENT_INFO,
+      capabilities: {
+        experimentalApi: true,
+      },
+    }, timeoutMs);
+    await this.notify("initialized");
+  }
+
+  async startThread(options: CreateOptions): Promise<ThreadSummary> {
+    const params = sessionParams(options);
+    const result = await this.request("thread/start", params, options.timeoutMs);
+    const thread = asRecord(result).thread;
+    if (!isRecord(thread)) {
+      throw new Error(`thread/start response did not contain result.thread: ${stringify(result)}`);
+    }
+    return thread as ThreadSummary;
+  }
+
+  async startTurn(threadId: string, message: string, options: CreateOptions): Promise<TurnSummary> {
+    const params: Record<string, unknown> = {
+      threadId,
+      input: [{ type: "text", text: message }],
+    };
+    Object.assign(params, turnParams(options));
+
+    const result = await this.request("turn/start", params, options.timeoutMs);
+    const turn = asRecord(result).turn;
+    if (!isRecord(turn)) {
+      throw new Error(`turn/start response did not contain result.turn: ${stringify(result)}`);
+    }
+    return turn as TurnSummary;
+  }
+
+  async request(
+    method: string,
+    params: Record<string, unknown>,
+    timeoutMs: number,
+  ): Promise<unknown> {
+    const id = this.#nextId++;
+    await this.#write({ id, method, params });
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const remaining = Math.max(1, deadline - Date.now());
+      const message = await this.#readMessage(remaining);
+      if (!message) break;
+
+      if (isRecord(message) && message.id === id) {
+        const response = message as JsonRpcResponse;
+        if (response.error) {
+          const detail = response.error.data ? ` ${stringify(response.error.data)}` : "";
+          throw new Error(
+            `${method} failed: ${response.error.message ?? "unknown error"}${detail}`,
+          );
+        }
+        return response.result;
+      }
+    }
+
+    const stderr = this.#stderr.trim();
+    throw new Error(
+      `Timed out waiting for ${method} response after ${timeoutMs}ms${
+        stderr ? `\napp-server stderr:\n${stderr}` : ""
+      }`,
+    );
+  }
+
+  async notify(method: string, params?: Record<string, unknown>) {
+    await this.#write({ method, params });
+  }
+
+  async close() {
+    try {
+      await this.#stdin?.close();
+    } catch {
+      // Process may already have exited.
+    }
+    try {
+      this.#process?.kill("SIGTERM");
+    } catch {
+      // Process may already have exited.
+    }
+    this.#ws?.close();
+
+    this.#stdout?.cancel().catch(() => undefined);
+    this.#stderrReader?.cancel().catch(() => undefined);
+  }
+
+  async #write(message: JsonRpcRequest) {
+    if (this.#ws) {
+      this.#ws.send(JSON.stringify(message));
+      return;
+    }
+
+    if (!this.#stdin) throw new Error("app-server process is not started");
+    await this.#stdin.write(this.#encoder.encode(`${JSON.stringify(message)}\n`));
+  }
+
+  async #readMessage(timeoutMs: number): Promise<unknown | undefined> {
+    if (this.#ws) return await this.#readWebSocketMessage(timeoutMs);
+
+    if (!this.#stdout) throw new Error("app-server process is not started");
+
+    while (true) {
+      const newline = this.#buffer.indexOf("\n");
+      if (newline >= 0) {
+        const line = this.#buffer.slice(0, newline).trim();
+        this.#buffer = this.#buffer.slice(newline + 1);
+        if (!line) continue;
+        return JSON.parse(line);
+      }
+
+      const read = this.#stdout.read();
+      const timeout = new Promise<undefined>((resolve) =>
+        setTimeout(() => resolve(undefined), timeoutMs)
+      );
+      const result = await Promise.race([read, timeout]);
+      if (!result) return undefined;
+      if (result.done) return undefined;
+      this.#buffer += this.#decoder.decode(result.value, { stream: true });
+    }
+  }
+
+  async #collectStderr(stderr: ReadableStream<Uint8Array>) {
+    const reader = stderr.getReader();
+    this.#stderrReader = reader;
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) return;
+        this.#stderr += this.#decoder.decode(chunk.value, { stream: true });
+      }
+    } catch {
+      // Best effort diagnostics only.
+    }
+  }
+
+  async #connectWebSocket(url: string) {
+    const ws = new WebSocket(url);
+    this.#ws = ws;
+
+    ws.onmessage = (event) => {
+      const value = JSON.parse(String(event.data));
+      const waiter = this.#wsWaiters.shift();
+      if (waiter) {
+        waiter(value);
+      } else {
+        this.#wsMessages.push(value);
+      }
+    };
+
+    ws.onerror = () => {
+      this.#resolveWebSocketWaiters(undefined);
+    };
+    ws.onclose = () => {
+      this.#resolveWebSocketWaiters(undefined);
+    };
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error(`Timed out connecting to ${url}`)), 5_000);
+      ws.onopen = () => {
+        clearTimeout(timeout);
+        resolve();
+      };
+      ws.onerror = () => {
+        clearTimeout(timeout);
+        this.#resolveWebSocketWaiters(undefined);
+        reject(new Error(`Failed to connect to ${url}`));
+      };
+    });
+  }
+
+  async #readWebSocketMessage(timeoutMs: number): Promise<unknown | undefined> {
+    const message = this.#wsMessages.shift();
+    if (message) return message;
+
+    return await new Promise<unknown | undefined>((resolve) => {
+      const timeout = setTimeout(() => {
+        const index = this.#wsWaiters.indexOf(resolve);
+        if (index >= 0) this.#wsWaiters.splice(index, 1);
+        resolve(undefined);
+      }, timeoutMs);
+      this.#wsWaiters.push((value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      });
+    });
+  }
+
+  #resolveWebSocketWaiters(value: unknown | undefined) {
+    const waiters = this.#wsWaiters.splice(0);
+    for (const waiter of waiters) waiter(value);
+  }
+}
+
+const approvalPolicyType = new EnumType(["untrusted", "on-request", "on-failure", "never"]);
+const sandboxType = new EnumType(["readOnly", "workspaceWrite", "dangerFullAccess"]);
+const personalityType = new EnumType(["friendly", "pragmatic", "none"]);
+
+await new Command()
+  .name("cxs")
+  .version("0.1.0")
+  .description("Create Codex app-server sessions from the command line.")
+  .type("approval-policy", approvalPolicyType)
+  .type("sandbox", sandboxType)
+  .type("personality", personalityType)
+  .command("create", "Create a Codex session and optionally start its first turn.")
+  .description(
+    "Creates a Codex app-server thread. By default, cxs reuses a reachable local WebSocket app-server, then falls back to spawning `codex app-server` over stdio.",
+  )
+  .option("--connect <url:string>", "Use an existing app-server WebSocket URL.")
+  .option("--codex-command <command:string>", "Codex executable to run.", {
+    default: DEFAULT_CODEX_COMMAND,
+  })
+  .option("--cwd <path:string>", "Working directory for the Codex session.", {
+    default: Deno.cwd(),
+  })
+  .option("--model <model:string>", "Model override for the new session.")
+  .option("--message <text:string>", "Initial user message to send after creating the session.")
+  .option("--approval-policy <policy:approval-policy>", "Approval policy override.")
+  .option("--sandbox <mode:sandbox>", "Sandbox mode override.")
+  .option("--personality <personality:personality>", "Codex personality override.")
+  .option("--timeout-ms <ms:integer>", "Request timeout in milliseconds.", {
+    default: DEFAULT_TIMEOUT_MS,
+  })
+  .option("--json", "Print machine-readable output.", { default: false })
+  .action(async (rawOptions: RawCreateOptions) => {
+    let exitCode = 0;
+    let client: AppServerClient | undefined;
+    try {
+      const options = await createOptions(rawOptions);
+      client = new AppServerClient(options.codexCommand, options.connect);
+      await client.start();
+      await client.initialize(options.timeoutMs);
+      const thread = await client.startThread(options);
+      const turn = thread.id && options.message
+        ? await client.startTurn(thread.id, options.message, options)
+        : undefined;
+
+      printCreateResult({ thread, turn, options });
+    } catch (error) {
+      exitCode = 1;
+      printError(error);
+    } finally {
+      await client?.close();
+      Deno.exit(exitCode);
+    }
+  })
+  .parse(Deno.args);
+
+async function createOptions(rawOptions: RawCreateOptions): Promise<CreateOptions> {
+  const options: CreateOptions = {
+    codexCommand: asString(rawOptions.codexCommand) ?? DEFAULT_CODEX_COMMAND,
+    connect: asString(rawOptions.connect),
+    cwd: asString(rawOptions.cwd) ?? Deno.cwd(),
+    model: asString(rawOptions.model),
+    approvalPolicy: asString(rawOptions.approvalPolicy),
+    sandbox: asString(rawOptions.sandbox),
+    personality: asString(rawOptions.personality),
+    message: asString(rawOptions.message),
+    timeoutMs: asNumber(rawOptions.timeoutMs) ?? DEFAULT_TIMEOUT_MS,
+    json: rawOptions.json === true,
+  };
+
+  await validateOptions(options);
+  if (!options.connect) {
+    options.connect = await discoverAppServerWebSocket();
+  }
+  return options;
+}
+
+async function validateOptions(options: CreateOptions) {
+  if (options.timeoutMs <= 0) {
+    throw new Error("--timeout-ms must be greater than 0.");
+  }
+  if (options.connect && !options.connect.startsWith("ws://")) {
+    throw new Error("--connect must be a ws:// URL.");
+  }
+
+  const cwd = await Deno.stat(options.cwd).catch(() => undefined);
+  if (!cwd) throw new Error(`--cwd does not exist: ${options.cwd}`);
+  if (!cwd.isDirectory) throw new Error(`--cwd must be a directory: ${options.cwd}`);
+}
+
+function sessionParams(options: CreateOptions): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+  if (options.model) params.model = options.model;
+  if (options.cwd) params.cwd = options.cwd;
+  if (options.approvalPolicy) params.approvalPolicy = options.approvalPolicy;
+  if (options.sandbox) params.sandbox = options.sandbox;
+  if (options.personality) params.personality = options.personality;
+  return params;
+}
+
+function turnParams(options: CreateOptions): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+  if (options.cwd) params.cwd = options.cwd;
+  if (options.model) params.model = options.model;
+  if (options.personality) params.personality = options.personality;
+  return params;
+}
+
+function printCreateResult(
+  { thread, turn, options }: { thread: ThreadSummary; turn?: TurnSummary; options: CreateOptions },
+) {
+  if (options.json) {
+    console.log(JSON.stringify({ thread, turn }, null, 2));
+    return;
+  }
+
+  if (options.connect) console.log(`Connected app-server: ${options.connect}`);
+  console.log(`Created Codex session: ${thread.id}`);
+  if (turn?.id) console.log(`Started turn: ${turn.id}`);
+  if (thread.modelProvider) console.log(`Model provider: ${thread.modelProvider}`);
+  if (thread.preview) console.log(`Preview: ${thread.preview}`);
+}
+
+function printError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(message);
+
+  if (message.includes("No such file or directory") || message.includes("os error 2")) {
+    console.error("Hint: install Codex or pass --codex-command /path/to/codex.");
+  } else if (message.includes("read-only") || message.includes("Readonly")) {
+    console.error("Hint: set CODEX_HOME to a writable directory before running cxs.");
+  } else if (message.includes("Timed out")) {
+    console.error("Hint: increase --timeout-ms or check that the app-server is healthy.");
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) throw new Error(`Expected object, got ${stringify(value)}`);
+  return value;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" ? value : undefined;
+}
+
+async function discoverAppServerWebSocket(): Promise<string | undefined> {
+  const command = new Deno.Command("ps", {
+    args: ["-eo", "args="],
+    stdout: "piped",
+    stderr: "null",
+  });
+  const output = await command.output().catch(() => undefined);
+  if (!output?.success) return undefined;
+
+  const text = new TextDecoder().decode(output.stdout);
+  const candidates = new Set<string>();
+  for (const line of text.split("\n")) {
+    if (!line.includes("app-server") || !line.includes("--listen")) continue;
+    for (const match of line.matchAll(/--listen(?:=|\s+)(ws:\/\/[^\s'"]+)/g)) {
+      candidates.add(match[1]);
+    }
+  }
+
+  for (const url of candidates) {
+    if (await canConnectWebSocket(url)) return url;
+  }
+  return undefined;
+}
+
+async function canConnectWebSocket(url: string): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const ws = new WebSocket(url);
+    const timeout = setTimeout(() => {
+      ws.close();
+      resolve(false);
+    }, 1_000);
+
+    ws.onopen = () => {
+      clearTimeout(timeout);
+      ws.close();
+      resolve(true);
+    };
+    ws.onerror = () => {
+      clearTimeout(timeout);
+      resolve(false);
+    };
+  });
+}
+
+function stringify(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
