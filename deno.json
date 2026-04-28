@@ -1,6 +1,6 @@
 {
   "tasks": {
-    "cxs": "deno run --allow-run=codex,ps,git --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost src/main.ts",
+    "cola": "deno run --allow-run=codex,ps,git --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost src/main.ts",
     "check": "deno fmt --check && deno lint && deno check src/main.ts",
     "fmt": "deno fmt"
   },

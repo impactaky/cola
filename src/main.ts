@@ -70,8 +70,8 @@ const DEFAULT_CODEX_COMMAND = "codex";
 const DEFAULT_TIMEOUT_MS = 15_000;
 
 const CLIENT_INFO = {
-  name: "cxs",
-  title: "Codex Session CLI",
+  name: "cola",
+  title: "Codex Operator for Local Automation",
   version: "0.1.0",
 };
 
@@ -322,7 +322,7 @@ const createCommand = addSessionOptions(new Command(), { cwd: true, worktree: tr
   .type("sandbox", sandboxType)
   .type("personality", personalityType)
   .description(
-    "Creates a Codex app-server thread. By default, cxs reuses a reachable local WebSocket app-server, then falls back to spawning `codex app-server` over stdio.",
+    "Creates a Codex app-server thread. By default, cola reuses a reachable local WebSocket app-server, then falls back to spawning `codex app-server` over stdio.",
   )
   .option("--message <text:string>", "Initial user message to send after creating the session.")
   .action(async (rawOptions: RawCreateOptions) => {
@@ -379,7 +379,7 @@ const repoCommand = new Command()
   });
 
 const configCommand = new Command()
-  .description("Manage cxs configuration.")
+  .description("Manage cola configuration.")
   .command("get <key:string>", "Print a config value.")
   .action(async (_options: void, key: string) => {
     await runAction(async () => {
@@ -409,7 +409,7 @@ const configCommand = new Command()
   .reset();
 
 await new Command()
-  .name("cxs")
+  .name("cola")
   .version("0.1.0")
   .description("Create Codex app-server sessions from the command line.")
   .type("approval-policy", approvalPolicyType)
@@ -583,7 +583,7 @@ function printError(error: unknown) {
   if (message.includes("No such file or directory") || message.includes("os error 2")) {
     console.error("Hint: install Codex or pass --codex-command /path/to/codex.");
   } else if (message.includes("read-only") || message.includes("Readonly")) {
-    console.error("Hint: set CODEX_HOME to a writable directory before running cxs.");
+    console.error("Hint: set CODEX_HOME to a writable directory before running cola.");
   } else if (message.includes("Timed out")) {
     console.error("Hint: increase --timeout-ms or check that the app-server is healthy.");
   }
@@ -662,7 +662,7 @@ async function resolveRepo(name: string): Promise<RepoConfig> {
   }
 
   throw new Error(
-    `No registered repo named ${name}. Register it with: cxs repo register ${name} <path>`,
+    `No registered repo named ${name}. Register it with: cola repo register ${name} <path>`,
   );
 }
 
@@ -714,15 +714,13 @@ function configPath(): string {
 }
 
 function configDir(): string {
-  return Deno.env.get("CXS_CONFIG_DIR") ?? defaultConfigDir();
-}
-
-function defaultConfigDir(): string {
   const xdg = Deno.env.get("XDG_CONFIG_HOME");
-  if (xdg) return `${xdg}/cxs`;
+  if (xdg) return `${xdg}/cola`;
+
   const home = Deno.env.get("HOME");
-  if (home) return `${home}/.config/cxs`;
-  return `${Deno.cwd()}/.cxs`;
+  if (home) return `${home}/.config/cola`;
+
+  throw new Error("Cannot determine XDG config directory: HOME is not set.");
 }
 
 function codexHome(): string {
