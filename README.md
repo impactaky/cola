@@ -4,24 +4,29 @@ Small Deno CLI for creating Codex app-server sessions.
 
 `cola` is short for **Codex Operator for Local Automation**.
 
-It starts or connects to `codex app-server`, creates a Codex thread, and optionally sends the first
-user message.
+It starts or connects to `codex app-server`, creates a Codex thread, and sends the first user
+message. If no message is provided on the command line, `cola create` opens the editor configured by
+`$VISUAL` or `$EDITOR`.
 
 ## Quick Start
 
 Install the CLI:
 
 ```sh
-deno install --global --config deno.json --allow-run=codex,ps,git --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost --name cola ./src/main.ts
+deno install --global --config deno.json --allow-run=codex,ps,git,"$EDITOR" --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost --name cola ./src/main.ts
 ```
 
-Create a session in the current directory:
+Open your editor, then create a session and send the saved text as the first message:
 
 ```sh
 cola create
 ```
 
-Create a session and immediately start a turn:
+The install command permits the editor executable from `$VISUAL` or `$EDITOR`. If your editor
+command includes arguments, such as `code --wait`, only the executable name is added to
+`--allow-run`.
+
+Create a session with an inline first message:
 
 ```sh
 cola create "Run the tests and reposrt failure"

@@ -1,4 +1,4 @@
-#!/usr/bin/env -S deno run --allow-run=codex,ps,git --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost
+#!/usr/bin/env -S deno run --allow-run=codex,ps,git,vi --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost
 
 import { Command, EnumType } from "@cliffy/command";
 
@@ -514,6 +514,7 @@ async function createOptions(rawOptions: RawCreateOptions): Promise<CreateOption
     worktree: asString(rawOptions.worktree),
     branch: asString(rawOptions.branch),
   };
+  options.message ??= await promptMessageInEditor();
 
   if (options.worktree) {
     const description = options.message ?? "session";
@@ -608,6 +609,66 @@ function asString(value: unknown): string | undefined {
 
 function asNumber(value: unknown): number | undefined {
   return typeof value === "number" ? value : undefined;
+}
+
+async function promptMessageInEditor(): Promise<string> {
+  const path = await Deno.makeTempFile({ prefix: "cola-message-", suffix: ".md" });
+  try {
+    const editor = Deno.env.get("VISUAL") || Deno.env.get("EDITOR") || "vi";
+    const [editorCommand, ...editorArgs] = parseCommand(editor);
+    const command = new Deno.Command(editorCommand, {
+      args: [...editorArgs, path],
+      stdin: "inherit",
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    const output = await command.output();
+    if (!output.success) {
+      throw new Error(`Editor exited with status ${output.code}.`);
+    }
+
+    const message = (await Deno.readTextFile(path)).trim();
+    if (!message) throw new Error("Aborted: message is empty.");
+    return message;
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+}
+
+function parseCommand(value: string): string[] {
+  const result: string[] = [];
+  let current = "";
+  let quote: string | undefined;
+
+  for (let index = 0; index < value.length; index++) {
+    const character = value[index];
+    if (quote) {
+      if (character === quote) {
+        quote = undefined;
+      } else {
+        current += character;
+      }
+      continue;
+    }
+
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      if (current) {
+        result.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += character;
+  }
+
+  if (quote) throw new Error(`Invalid editor command: unmatched ${quote} quote.`);
+  if (current) result.push(current);
+  if (result.length === 0) throw new Error("Editor command cannot be empty.");
+  return result;
 }
 
 async function discoverAppServerWebSocket(): Promise<string | undefined> {
