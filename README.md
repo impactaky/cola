@@ -10,7 +10,7 @@ user message.
 Install the CLI:
 
 ```sh
-deno install --global --allow-run=codex,ps --allow-read --allow-env --allow-net=127.0.0.1,localhost --name cxs ./src/main.ts
+deno install --global --allow-run=codex,ps,git --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost --name cxs ./src/main.ts
 ```
 
 Create a session in the current directory:
@@ -50,6 +50,45 @@ Use a non-default Codex executable:
 
 ```sh
 cxs create --codex-command /path/to/codex
+```
+
+## Config and Worktrees
+
+`cxs` stores configuration in `$CXS_CONFIG_DIR/config.json` when `CXS_CONFIG_DIR` is set, otherwise
+under `$XDG_CONFIG_HOME/cxs/config.json` or `~/.config/cxs/config.json`.
+
+Register a local repository by name:
+
+```sh
+cxs repo register cxs /path/to/repo --branch main
+```
+
+Inspect and edit config values:
+
+```sh
+cxs repo list
+cxs config get repos.cxs.path
+cxs config set repos.cxs.branch trunk
+```
+
+Create a new git worktree from a registered repository and start a Codex session in it:
+
+```sh
+cxs worktree cxs "implement config-backed worktrees"
+```
+
+The worktree command follows the Codex App layout and creates a detached worktree under
+`$CODEX_HOME/worktrees/<id>/<repo-name>`, or `~/.codex/worktrees/<id>/<repo-name>` when `CODEX_HOME`
+is not set. Use `--branch` to override the base branch for one run:
+
+```sh
+cxs worktree cxs "test migration" --branch develop
+```
+
+`create` can also prepare the worktree before creating the Codex session:
+
+```sh
+cxs create --worktree cxs --message "implement config-backed worktrees"
 ```
 
 ## How It Works
