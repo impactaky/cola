@@ -321,12 +321,16 @@ const createCommand = addSessionOptions(new Command(), { cwd: true, worktree: tr
   .type("approval-policy", approvalPolicyType)
   .type("sandbox", sandboxType)
   .type("personality", personalityType)
+  .arguments("[message:string]")
   .description(
     "Creates a Codex app-server thread. By default, cola reuses a reachable local WebSocket app-server, then falls back to spawning `codex app-server` over stdio.",
   )
-  .option("--message <text:string>", "Initial user message to send after creating the session.")
-  .action(async (rawOptions: RawCreateOptions) => {
-    await runCreateCommand(rawOptions);
+  .action(async (...args: unknown[]) => {
+    const [rawOptions, message] = args as [RawCreateOptions, string?];
+    await runCreateCommand({
+      ...rawOptions,
+      message,
+    });
   });
 
 const worktreeCommand = addSessionOptions(new Command(), { branch: true })

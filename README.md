@@ -12,7 +12,7 @@ user message.
 Install the CLI:
 
 ```sh
-deno install --global --allow-run=codex,ps,git --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost --name cola ./src/main.ts
+deno install --global --config deno.json --allow-run=codex,ps,git --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost --name cola ./src/main.ts
 ```
 
 Create a session in the current directory:
@@ -24,7 +24,7 @@ cola create
 Create a session and immediately start a turn:
 
 ```sh
-cola create --message "Run the tests and report failures"
+cola create "Run the tests and reposrt failure"
 ```
 
 Print JSON for scripts:
@@ -45,7 +45,7 @@ Connect to an app-server that is already listening on WebSocket:
 
 ```sh
 codex app-server --listen ws://127.0.0.1:9234
-cola create --connect ws://127.0.0.1:9234 --message "Run tests"
+cola create --connect ws://127.0.0.1:9234 "Run tests"
 ```
 
 Use a non-default Codex executable:
@@ -90,7 +90,7 @@ cola worktree cola "test migration" --branch develop
 `create` can also prepare the worktree before creating the Codex session:
 
 ```sh
-cola create --worktree cola --message "implement config-backed worktrees"
+cola create --worktree cola "implement config-backed worktrees"
 ```
 
 ## How It Works
