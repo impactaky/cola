@@ -1,6 +1,7 @@
 #!/usr/bin/env -S deno run --allow-run=codex,ps,git,vi --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost
 
 import { Command, EnumType } from "@cliffy/command";
+import { CompletionsCommand } from "@cliffy/command/completions";
 
 type JsonRpcId = number | string;
 
@@ -428,6 +429,8 @@ await new Command()
   .command("repo", repoCommand)
   .reset()
   .command("config", configCommand)
+  .reset()
+  .command("completions", new CompletionsCommand())
   .parse(Deno.args);
 
 function addSessionOptions(

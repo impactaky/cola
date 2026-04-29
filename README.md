@@ -38,6 +38,28 @@ Print JSON for scripts:
 cola create --json
 ```
 
+## Shell Completion
+
+Generate shell completions with `cola completions` after installing the CLI.
+
+For bash, add this to `~/.bashrc`:
+
+```sh
+source <(cola completions bash)
+```
+
+For zsh, add this to `~/.zshrc`:
+
+```sh
+source <(cola completions zsh)
+```
+
+For fish, add this to `~/.config/fish/config.fish`:
+
+```fish
+cola completions fish | source
+```
+
 ## Common Options
 
 Choose the workspace or model:
