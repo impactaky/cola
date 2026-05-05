@@ -100,6 +100,23 @@ cola config get repos.cola.path
 cola config set repos.cola.branch trunk
 ```
 
+Register a reusable description prefix:
+
+```sh
+cola alias add fix "Fix: "
+cola create fix "handle empty config"
+```
+
+The first positional message token is expanded when it matches a registered alias, so the session
+above receives `Fix: handle empty config`. Worktrees use the same message expansion. Without an
+explicit repo name, `worktree` creates the worktree from the current git repository:
+
+```sh
+cola worktree fix "handle empty config"
+cola worktree cola fix "handle empty config"
+cola create --worktree cola fix "handle empty config"
+```
+
 Create a new git worktree from a registered repository and start a Codex session in it:
 
 ```sh

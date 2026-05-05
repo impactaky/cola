@@ -54,6 +54,7 @@ type RawCreateOptions = Record<string, unknown>;
 
 type Config = {
   repos?: Record<string, RepoConfig>;
+  aliases?: Record<string, string>;
 };
 
 type RepoConfig = {
@@ -322,15 +323,15 @@ const createCommand = addSessionOptions(new Command(), { cwd: true, worktree: tr
   .type("approval-policy", approvalPolicyType)
   .type("sandbox", sandboxType)
   .type("personality", personalityType)
-  .arguments("[message:string]")
+  .arguments("[message...:string]")
   .description(
     "Creates a Codex app-server thread. By default, cola reuses a reachable local WebSocket app-server, then falls back to spawning `codex app-server` over stdio.",
   )
   .action(async (...args: unknown[]) => {
-    const [rawOptions, message] = args as [RawCreateOptions, string?];
+    const [rawOptions, ...messageParts] = args as [RawCreateOptions, ...string[]];
     await runCreateCommand({
       ...rawOptions,
-      message,
+      message: await resolveMessageAlias(messageParts),
     });
   });
 
@@ -338,16 +339,21 @@ const worktreeCommand = addSessionOptions(new Command(), { branch: true })
   .type("approval-policy", approvalPolicyType)
   .type("sandbox", sandboxType)
   .type("personality", personalityType)
-  .arguments("<repo:string> <description:string>")
+  .arguments("<repo-or-alias:string> [description...:string]")
   .description(
     "Creates a git worktree from a registered repository, then starts a Codex session in that worktree directory.",
   )
   .action(async (...args: unknown[]) => {
-    const [rawOptions, repo, description] = args as [RawCreateOptions, string, string];
+    const [rawOptions, repoOrAlias, ...descriptionParts] = args as [
+      RawCreateOptions,
+      string,
+      ...string[],
+    ];
+    const worktreeArgs = await resolveWorktreeArgs(repoOrAlias, descriptionParts);
     await runCreateCommand({
       ...rawOptions,
-      worktree: repo,
-      message: description,
+      worktree: worktreeArgs.repo,
+      message: worktreeArgs.message,
       cwd: Deno.cwd(),
     });
   });
@@ -413,6 +419,37 @@ const configCommand = new Command()
   })
   .reset();
 
+const aliasCommand = new Command()
+  .description("Manage description aliases.")
+  .command("add <name:string> <prefix...:string>", "Register a description prefix alias.")
+  .action(async (_options: void, name: string, ...prefixParts: string[]) => {
+    await runAction(async () => {
+      const prefix = prefixParts.join(" ");
+      if (!prefix) throw new Error("Alias prefix cannot be empty.");
+      await upsertAlias(name, prefix);
+      console.log(`Registered alias ${name}: ${prefix}`);
+    });
+  })
+  .command("list", "List description aliases.")
+  .action(async () => {
+    await runAction(async () => {
+      const aliases = (await readConfig()).aliases ?? {};
+      for (const [name, prefix] of Object.entries(aliases)) {
+        console.log(`${name}\t${prefix}`);
+      }
+    });
+  })
+  .command("remove <name:string>", "Remove a description alias.")
+  .action(async (_options: void, name: string) => {
+    await runAction(async () => {
+      const config = await readConfig();
+      if (!config.aliases?.[name]) throw new Error(`No registered alias named ${name}.`);
+      delete config.aliases[name];
+      await writeConfig(config);
+      console.log(`Removed alias ${name}`);
+    });
+  });
+
 await new Command()
   .name("cola")
   .version("0.1.0")
@@ -429,6 +466,8 @@ await new Command()
   .command("repo", repoCommand)
   .reset()
   .command("config", configCommand)
+  .reset()
+  .command("alias", aliasCommand)
   .reset()
   .command("completions", new CompletionsCommand())
   .parse(Deno.args);
@@ -500,6 +539,44 @@ async function runAction(action: () => Promise<void>) {
     printError(error);
     Deno.exit(1);
   }
+}
+
+async function resolveMessageAlias(parts: string[]): Promise<string | undefined> {
+  return resolveMessageAliasFromConfig(await readConfig(), parts);
+}
+
+function resolveMessageAliasFromConfig(
+  config: Config,
+  parts: string[],
+): string | undefined {
+  if (parts.length === 0) return undefined;
+
+  const [first, ...rest] = parts;
+  const prefix = config.aliases?.[first];
+  if (prefix === undefined) return parts.join(" ");
+  return `${prefix}${rest.join(" ")}`;
+}
+
+async function resolveWorktreeArgs(
+  repoOrAlias: string,
+  descriptionParts: string[],
+): Promise<{ repo: string; message: string | undefined }> {
+  const config = await readConfig();
+  const firstTokenIsAlias = config.aliases?.[repoOrAlias] !== undefined;
+  const firstTokenLooksLikeRepo = config.repos?.[repoOrAlias] !== undefined ||
+    Boolean((await Deno.stat(repoOrAlias).catch(() => undefined))?.isDirectory);
+
+  if (firstTokenIsAlias && !firstTokenLooksLikeRepo) {
+    return {
+      repo: Deno.cwd(),
+      message: resolveMessageAliasFromConfig(config, [repoOrAlias, ...descriptionParts]),
+    };
+  }
+
+  return {
+    repo: repoOrAlias,
+    message: resolveMessageAliasFromConfig(config, descriptionParts),
+  };
 }
 
 async function createOptions(rawOptions: RawCreateOptions): Promise<CreateOptions> {
@@ -735,13 +812,27 @@ async function resolveRepo(name: string): Promise<RepoConfig> {
 }
 
 async function upsertRepo(name: string, repo: RepoConfig) {
-  if (!/^[A-Za-z0-9_.-]+$/.test(name)) {
-    throw new Error("Repo name may only contain letters, numbers, dots, underscores, and hyphens.");
-  }
+  validateConfigName(name, "Repo");
   const config = await readConfig();
   config.repos ??= {};
   config.repos[name] = repo;
   await writeConfig(config);
+}
+
+async function upsertAlias(name: string, prefix: string) {
+  validateConfigName(name, "Alias");
+  const config = await readConfig();
+  config.aliases ??= {};
+  config.aliases[name] = prefix;
+  await writeConfig(config);
+}
+
+function validateConfigName(name: string, label: string) {
+  if (!/^[A-Za-z0-9_.-]+$/.test(name)) {
+    throw new Error(
+      `${label} name may only contain letters, numbers, dots, underscores, and hyphens.`,
+    );
+  }
 }
 
 async function gitRoot(path: string): Promise<string> {
