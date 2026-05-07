@@ -82,11 +82,14 @@ Choose the workspace or model:
 cola create --cwd "$PWD" --model gpt-5.4
 ```
 
-Connect to an app-server that is already listening on WebSocket:
+Connect to an app-server that is already listening on WebSocket or a Unix socket:
 
 ```sh
 codex app-server --listen ws://127.0.0.1:9234
 cola create --connect ws://127.0.0.1:9234 "Run tests"
+
+codex app-server --listen unix://
+cola create --connect unix:// "Run tests"
 ```
 
 Use a non-default Codex executable:
@@ -157,9 +160,10 @@ When `--connect` is omitted, `cola` looks for a running process like:
 
 ```sh
 codex app-server --listen ws://127.0.0.1:9234
+codex app-server --listen unix://
 ```
 
-If it finds a reachable local WebSocket endpoint, it reuses it. Otherwise it starts:
+If it finds a reachable local WebSocket or Unix-socket endpoint, it reuses it. Otherwise it starts:
 
 ```sh
 codex app-server

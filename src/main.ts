@@ -5,6 +5,8 @@ import { CompletionsCommand } from "@cliffy/command/completions";
 
 type JsonRpcId = number | string;
 
+type ByteArray = Uint8Array<ArrayBufferLike>;
+
 type JsonRpcRequest = {
   id?: JsonRpcId;
   method: string;
@@ -33,6 +35,8 @@ type TurnSummary = {
   id?: string;
   status?: unknown;
 };
+
+type AppServerTransport = "websocket" | "unix";
 
 type CreateOptions = {
   codexCommand: string;
@@ -77,6 +81,8 @@ const CLIENT_INFO = {
   version: "0.1.0",
 };
 
+const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
 class AppServerClient {
   #command: string;
   #process?: Deno.ChildProcess;
@@ -84,6 +90,7 @@ class AppServerClient {
   #stdout?: ReadableStreamDefaultReader<Uint8Array>;
   #stderrReader?: ReadableStreamDefaultReader<Uint8Array>;
   #ws?: WebSocket;
+  #unixWs?: UnixWebSocket;
   #wsMessages: unknown[] = [];
   #wsWaiters: Array<(value: unknown | undefined) => void> = [];
   #stderr = "";
@@ -101,7 +108,7 @@ class AppServerClient {
 
   async start() {
     if (this.#connectUrl) {
-      await this.#connectWebSocket(this.#connectUrl);
+      await this.#connectTransport(this.#connectUrl);
       return;
     }
 
@@ -203,23 +210,29 @@ class AppServerClient {
       // Process may already have exited.
     }
     this.#ws?.close();
+    this.#unixWs?.close();
 
     this.#stdout?.cancel().catch(() => undefined);
     this.#stderrReader?.cancel().catch(() => undefined);
   }
 
   async #write(message: JsonRpcRequest) {
+    const text = JSON.stringify(message);
     if (this.#ws) {
-      this.#ws.send(JSON.stringify(message));
+      this.#ws.send(text);
+      return;
+    }
+    if (this.#unixWs) {
+      await this.#unixWs.send(text);
       return;
     }
 
     if (!this.#stdin) throw new Error("app-server process is not started");
-    await this.#stdin.write(this.#encoder.encode(`${JSON.stringify(message)}\n`));
+    await this.#stdin.write(this.#encoder.encode(`${text}\n`));
   }
 
   async #readMessage(timeoutMs: number): Promise<unknown | undefined> {
-    if (this.#ws) return await this.#readWebSocketMessage(timeoutMs);
+    if (this.#ws || this.#unixWs) return await this.#readWebSocketMessage(timeoutMs);
 
     if (!this.#stdout) throw new Error("app-server process is not started");
 
@@ -241,6 +254,14 @@ class AppServerClient {
       if (result.done) return undefined;
       this.#buffer += this.#decoder.decode(result.value, { stream: true });
     }
+  }
+
+  async #connectTransport(url: string) {
+    if (transportForUrl(url) === "unix") {
+      await this.#connectUnixWebSocket(url);
+      return;
+    }
+    await this.#connectWebSocket(url);
   }
 
   async #collectStderr(stderr: ReadableStream<Uint8Array>) {
@@ -292,6 +313,24 @@ class AppServerClient {
     });
   }
 
+  async #connectUnixWebSocket(url: string) {
+    const unixWs = await UnixWebSocket.connect(url, 5_000);
+    this.#unixWs = unixWs;
+
+    unixWs.onmessage = (value) => {
+      const waiter = this.#wsWaiters.shift();
+      if (waiter) {
+        waiter(value);
+      } else {
+        this.#wsMessages.push(value);
+      }
+    };
+
+    unixWs.onclose = () => {
+      this.#resolveWebSocketWaiters(undefined);
+    };
+  }
+
   async #readWebSocketMessage(timeoutMs: number): Promise<unknown | undefined> {
     const message = this.#wsMessages.shift();
     if (message) return message;
@@ -315,6 +354,149 @@ class AppServerClient {
   }
 }
 
+class UnixWebSocket {
+  #conn: Deno.Conn;
+  #buffer: ByteArray;
+  #closed = false;
+  #decoder = new TextDecoder();
+  #encoder = new TextEncoder();
+  onmessage?: (value: unknown) => void;
+  onclose?: () => void;
+
+  private constructor(conn: Deno.Conn, buffer: ByteArray) {
+    this.#conn = conn;
+    this.#buffer = buffer;
+  }
+
+  static async connect(url: string, timeoutMs: number): Promise<UnixWebSocket> {
+    const path = unixSocketPath(url);
+    const conn = await withTimeout(
+      Deno.connect({ transport: "unix", path }),
+      timeoutMs,
+      `Timed out connecting to ${url}`,
+    );
+    const key = websocketKey();
+
+    try {
+      await writeAll(
+        conn,
+        new TextEncoder().encode(
+          [
+            "GET / HTTP/1.1",
+            "Host: localhost",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            `Sec-WebSocket-Key: ${key}`,
+            "Sec-WebSocket-Version: 13",
+            "",
+            "",
+          ].join("\r\n"),
+        ),
+      );
+
+      const { header, remainder } = await readHttpHeader(conn, timeoutMs);
+      await validateWebSocketHandshake(header, key, url);
+
+      const websocket = new UnixWebSocket(conn, remainder);
+      void websocket.#readLoop();
+      return websocket;
+    } catch (error) {
+      try {
+        conn.close();
+      } catch {
+        // Connection may already be closed.
+      }
+      if (error instanceof Error) throw error;
+      throw new Error(`Failed to connect to ${url}`);
+    }
+  }
+
+  async send(text: string) {
+    if (this.#closed) throw new Error("app-server WebSocket is closed");
+    await writeAll(this.#conn, encodeWebSocketFrame(0x1, this.#encoder.encode(text)));
+  }
+
+  close() {
+    if (this.#closed) return;
+    this.#closed = true;
+    try {
+      this.#conn.close();
+    } catch {
+      // Connection may already be closed.
+    }
+  }
+
+  async #readLoop() {
+    try {
+      while (!this.#closed) {
+        const frame = await this.#readFrame();
+        if (!frame) break;
+
+        if (frame.opcode === 0x1) {
+          this.onmessage?.(JSON.parse(this.#decoder.decode(frame.payload)));
+        } else if (frame.opcode === 0x8) {
+          break;
+        } else if (frame.opcode === 0x9) {
+          await writeAll(this.#conn, encodeWebSocketFrame(0xA, frame.payload));
+        }
+      }
+    } catch {
+      // The caller observes connection loss as a closed WebSocket.
+    } finally {
+      this.close();
+      this.onclose?.();
+    }
+  }
+
+  async #readFrame(): Promise<{ opcode: number; payload: ByteArray } | undefined> {
+    const header = await this.#readBytes(2);
+    if (!header) return undefined;
+
+    const opcode = header[0] & 0x0F;
+    const masked = (header[1] & 0x80) !== 0;
+    let length = header[1] & 0x7F;
+
+    if (length === 126) {
+      const extended = await this.#readBytes(2);
+      if (!extended) return undefined;
+      length = new DataView(extended.buffer, extended.byteOffset, extended.byteLength).getUint16(0);
+    } else if (length === 127) {
+      const extended = await this.#readBytes(8);
+      if (!extended) return undefined;
+      const value = new DataView(extended.buffer, extended.byteOffset, extended.byteLength)
+        .getBigUint64(0);
+      if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error("WebSocket frame is too large");
+      }
+      length = Number(value);
+    }
+
+    const mask = masked ? await this.#readBytes(4) : undefined;
+    const payload = await this.#readBytes(length);
+    if (!payload) return undefined;
+
+    if (mask) {
+      for (let index = 0; index < payload.length; index++) {
+        payload[index] ^= mask[index % 4];
+      }
+    }
+    return { opcode, payload };
+  }
+
+  async #readBytes(length: number): Promise<ByteArray | undefined> {
+    while (this.#buffer.length < length) {
+      const chunk = new Uint8Array(8192);
+      const read = await this.#conn.read(chunk);
+      if (read === null) return undefined;
+      this.#buffer = concatBytes(this.#buffer, chunk.slice(0, read));
+    }
+
+    const result = this.#buffer.slice(0, length);
+    this.#buffer = this.#buffer.slice(length);
+    return result;
+  }
+}
+
 const approvalPolicyType = new EnumType(["untrusted", "on-request", "on-failure", "never"]);
 const sandboxType = new EnumType(["readOnly", "workspaceWrite", "dangerFullAccess"]);
 const personalityType = new EnumType(["friendly", "pragmatic", "none"]);
@@ -325,7 +507,7 @@ const createCommand = addSessionOptions(new Command(), { cwd: true, worktree: tr
   .type("personality", personalityType)
   .arguments("[message...:string]")
   .description(
-    "Creates a Codex app-server thread. By default, cola reuses a reachable local WebSocket app-server, then falls back to spawning `codex app-server` over stdio.",
+    "Creates a Codex app-server thread. By default, cola reuses a reachable local app-server socket, then falls back to spawning `codex app-server` over stdio.",
   )
   .action(async (...args: unknown[]) => {
     const [rawOptions, ...messageParts] = args as [RawCreateOptions, ...string[]];
@@ -477,7 +659,7 @@ function addSessionOptions(
   options: { cwd?: boolean; worktree?: boolean; branch?: boolean } = {},
 ): Command {
   command
-    .option("--connect <url:string>", "Use an existing app-server WebSocket URL.")
+    .option("--connect <url:string>", "Use an existing app-server ws:// or unix:// URL.")
     .option("--codex-command <command:string>", "Codex executable to run.", {
       default: DEFAULT_CODEX_COMMAND,
     })
@@ -605,7 +787,7 @@ async function createOptions(rawOptions: RawCreateOptions): Promise<CreateOption
 
   await validateOptions(options);
   if (!options.connect) {
-    options.connect = await discoverAppServerWebSocket();
+    options.connect = await discoverAppServerSocket();
   }
   return options;
 }
@@ -614,8 +796,8 @@ async function validateOptions(options: CreateOptions) {
   if (options.timeoutMs <= 0) {
     throw new Error("--timeout-ms must be greater than 0.");
   }
-  if (options.connect && !options.connect.startsWith("ws://")) {
-    throw new Error("--connect must be a ws:// URL.");
+  if (options.connect && !transportForUrl(options.connect)) {
+    throw new Error("--connect must be a ws:// or unix:// URL.");
   }
 
   const cwd = await Deno.stat(options.cwd).catch(() => undefined);
@@ -751,7 +933,7 @@ function parseCommand(value: string): string[] {
   return result;
 }
 
-async function discoverAppServerWebSocket(): Promise<string | undefined> {
+async function discoverAppServerSocket(): Promise<string | undefined> {
   const command = new Deno.Command("ps", {
     args: ["-eo", "args="],
     stdout: "piped",
@@ -764,13 +946,13 @@ async function discoverAppServerWebSocket(): Promise<string | undefined> {
   const candidates = new Set<string>();
   for (const line of text.split("\n")) {
     if (!line.includes("app-server") || !line.includes("--listen")) continue;
-    for (const match of line.matchAll(/--listen(?:=|\s+)(ws:\/\/[^\s'"]+)/g)) {
+    for (const match of line.matchAll(/--listen(?:=|\s+)(ws:\/\/[^\s'"]+|unix:\/\/[^\s'"]*)/g)) {
       candidates.add(match[1]);
     }
   }
 
   for (const url of candidates) {
-    if (await canConnectWebSocket(url)) return url;
+    if (await canConnectAppServer(url)) return url;
   }
   return undefined;
 }
@@ -950,7 +1132,177 @@ function basename(path: string): string {
   return index >= 0 ? trimmed.slice(index + 1) : trimmed;
 }
 
-async function canConnectWebSocket(url: string): Promise<boolean> {
+function transportForUrl(url: string): AppServerTransport | undefined {
+  if (url.startsWith("ws://")) return "websocket";
+  if (url.startsWith("unix://")) return "unix";
+  return undefined;
+}
+
+function unixSocketPath(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "unix:") throw new Error();
+    if (!parsed.host && !parsed.pathname) return defaultAppServerSocketPath();
+    const path = parsed.pathname;
+    if (!path) throw new Error();
+    return decodeURIComponent(path);
+  } catch {
+    throw new Error(`Invalid unix:// URL: ${url}`);
+  }
+}
+
+function defaultAppServerSocketPath(): string {
+  return `${codexHome()}/app-server-control/app-server-control.sock`;
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timeoutId: number | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
+}
+
+async function writeAll(writer: { write(bytes: ByteArray): Promise<number> }, bytes: ByteArray) {
+  let offset = 0;
+  while (offset < bytes.length) {
+    offset += await writer.write(bytes.slice(offset));
+  }
+}
+
+async function readHttpHeader(
+  conn: Deno.Conn,
+  timeoutMs: number,
+): Promise<{ header: string; remainder: ByteArray }> {
+  let buffer: ByteArray = new Uint8Array(0);
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const chunk = new Uint8Array(4096);
+    const read = await withTimeout(
+      conn.read(chunk),
+      Math.max(1, deadline - Date.now()),
+      "Timed out waiting for WebSocket handshake",
+    );
+    if (read === null) break;
+    buffer = concatBytes(buffer, chunk.slice(0, read));
+
+    const headerEnd = indexOfBytes(buffer, new TextEncoder().encode("\r\n\r\n"));
+    if (headerEnd >= 0) {
+      return {
+        header: new TextDecoder().decode(buffer.slice(0, headerEnd)),
+        remainder: buffer.slice(headerEnd + 4),
+      };
+    }
+  }
+
+  throw new Error("Failed to read WebSocket handshake");
+}
+
+async function validateWebSocketHandshake(header: string, key: string, url: string) {
+  const lines = header.split("\r\n");
+  const status = lines.shift() ?? "";
+  if (!status.includes(" 101 ")) {
+    throw new Error(`Failed to connect to ${url}: ${status || "invalid handshake"}`);
+  }
+
+  const headers = new Map<string, string>();
+  for (const line of lines) {
+    const separator = line.indexOf(":");
+    if (separator < 0) continue;
+    headers.set(line.slice(0, separator).trim().toLowerCase(), line.slice(separator + 1).trim());
+  }
+
+  const expected = await websocketAccept(key);
+  if (headers.get("sec-websocket-accept") !== expected) {
+    throw new Error(`Failed to connect to ${url}: invalid WebSocket handshake`);
+  }
+}
+
+function websocketKey(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return base64(bytes);
+}
+
+async function websocketAccept(key: string): Promise<string> {
+  const hash = await crypto.subtle.digest(
+    "SHA-1",
+    new TextEncoder().encode(`${key}${WEBSOCKET_GUID}`),
+  );
+  return base64(new Uint8Array(hash));
+}
+
+function encodeWebSocketFrame(opcode: number, payload: ByteArray): ByteArray {
+  const mask = new Uint8Array(4);
+  crypto.getRandomValues(mask);
+
+  const lengthSize = payload.length < 126 ? 0 : payload.length <= 0xFFFF ? 2 : 8;
+  const frame = new Uint8Array(2 + lengthSize + mask.length + payload.length);
+  frame[0] = 0x80 | opcode;
+
+  let offset = 2;
+  if (payload.length < 126) {
+    frame[1] = 0x80 | payload.length;
+  } else if (payload.length <= 0xFFFF) {
+    frame[1] = 0x80 | 126;
+    new DataView(frame.buffer).setUint16(offset, payload.length);
+    offset += 2;
+  } else {
+    frame[1] = 0x80 | 127;
+    new DataView(frame.buffer).setBigUint64(offset, BigInt(payload.length));
+    offset += 8;
+  }
+
+  frame.set(mask, offset);
+  offset += mask.length;
+
+  for (let index = 0; index < payload.length; index++) {
+    frame[offset + index] = payload[index] ^ mask[index % 4];
+  }
+  return frame;
+}
+
+function concatBytes(left: ByteArray, right: ByteArray): ByteArray {
+  const result = new Uint8Array(left.length + right.length);
+  result.set(left);
+  result.set(right, left.length);
+  return result;
+}
+
+function indexOfBytes(buffer: ByteArray, pattern: ByteArray): number {
+  for (let index = 0; index <= buffer.length - pattern.length; index++) {
+    let matched = true;
+    for (let patternIndex = 0; patternIndex < pattern.length; patternIndex++) {
+      if (buffer[index + patternIndex] !== pattern[patternIndex]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) return index;
+  }
+  return -1;
+}
+
+function base64(bytes: ByteArray): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+async function canConnectAppServer(url: string): Promise<boolean> {
+  if (transportForUrl(url) === "unix") {
+    const client = await UnixWebSocket.connect(url, 1_000).catch(() => undefined);
+    client?.close();
+    return client !== undefined;
+  }
+
   return await new Promise<boolean>((resolve) => {
     const ws = new WebSocket(url);
     const timeout = setTimeout(() => {

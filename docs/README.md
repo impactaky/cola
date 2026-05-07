@@ -27,7 +27,7 @@ Use `cola` to create Codex app-server sessions from a terminal.
 
 - [Install cola](install.md)
 - [Create a Codex session](create-session.md)
-- [Use a Codex app-server WebSocket](connect-app-server.md)
+- [Use a Codex app-server socket](connect-app-server.md)
 - [Manage repositories and worktrees](worktrees.md)
 - [Manage config values](config.md)
 - [Use aliases](aliases.md)
