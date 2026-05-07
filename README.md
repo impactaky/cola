@@ -8,6 +8,8 @@ It starts or connects to `codex app-server`, creates a Codex thread, and sends t
 message. If no message is provided on the command line, `cola create` opens the editor configured by
 `$VISUAL` or `$EDITOR`.
 
+For task-focused CLI usage docs, start with [docs/README.md](docs/README.md).
+
 ## Quick Start
 
 Install the CLI:
@@ -37,6 +39,18 @@ Print JSON for scripts:
 ```sh
 cola create --json
 ```
+
+## Docker Command Test
+
+Build and run the containerized `cola` command test:
+
+```sh
+docker build -t cola-command-test .
+docker run --rm cola-command-test
+```
+
+The container installs the current `src/main.ts` as `cola`, then checks version, help, config, and
+alias commands in an isolated config directory.
 
 ## Shell Completion
 
