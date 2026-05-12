@@ -33,6 +33,6 @@ Generate shell completion scripts for the installed `cola` command.
 
 ## Expectations
 
-- The shell suggests `create`, `worktree`, `repo`, `config`, `alias`, and `completions`.
+- The shell suggests `create`, `worktree`, `repo`, `config`, `alias`, `bd`, and `completions`.
 - Command options appear after the command name.
 - Unknown completion targets print an error from the completions command.

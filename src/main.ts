@@ -1,4 +1,4 @@
-#!/usr/bin/env -S deno run --allow-run=codex,ps,git,vi --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost
+#!/usr/bin/env -S deno run --allow-run=bd,codex,ps,git,vi --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost
 
 import { Command, EnumType } from "@cliffy/command";
 import { CompletionsCommand } from "@cliffy/command/completions";
@@ -74,8 +74,22 @@ type WorktreeInfo = {
   baseBranch: string;
 };
 
+type BdStackTask = {
+  task: string;
+  branch: string;
+  baseBranch: string;
+};
+
+type BdIssue = {
+  id?: string;
+  title?: string;
+  description?: string;
+  metadata?: Record<string, unknown>;
+};
+
 const DEFAULT_CODEX_COMMAND = "codex";
 const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_BD_STACK_WAIT_MS = 0;
 
 const CLIENT_INFO = {
   name: "cola",
@@ -634,6 +648,39 @@ const aliasCommand = new Command()
     });
   });
 
+const bdCommand = new Command()
+  .description("Run bd-backed Cola task automation.")
+  .command("stack <repo:string>", "Start one Codex session per bd task as a stacked PR chain.")
+  .type("approval-policy", approvalPolicyType)
+  .type("sandbox", sandboxType)
+  .type("personality", personalityType)
+  .option("--tasks <tasks:string>", "Explicit ordered comma-separated bd task IDs.")
+  .option("--base <branch:string>", "Base branch for the first task.", { default: "main" })
+  .option("--limit <count:integer>", "Limit how many tasks from --tasks to start.")
+  .option("--dry-run", "Print the planned stack without side effects.", { default: false })
+  .option("--connect <url:string>", "Use an existing app-server ws:// or unix:// URL.")
+  .option("--codex-command <command:string>", "Codex executable to run.", {
+    default: DEFAULT_CODEX_COMMAND,
+  })
+  .option("--model <model:string>", "Model override for the new sessions.")
+  .option("--approval-policy <policy:approval-policy>", "Approval policy override.")
+  .option("--sandbox <mode:sandbox>", "Sandbox mode override.")
+  .option("--personality <personality:personality>", "Codex personality override.")
+  .option("--timeout-ms <ms:integer>", "Request timeout in milliseconds.", {
+    default: DEFAULT_TIMEOUT_MS,
+  })
+  .option(
+    "--wait-ms <ms:integer>",
+    "Maximum inter-task wait for previous PR metadata. Defaults to 0, which waits forever.",
+    { default: DEFAULT_BD_STACK_WAIT_MS },
+  )
+  .action(async (rawOptions: RawCreateOptions, repo: string) => {
+    await runAction(async () => {
+      await runBdStackCommand(repo, rawOptions);
+    });
+  })
+  .reset();
+
 await new Command()
   .name("cola")
   .version("0.1.0")
@@ -652,6 +699,8 @@ await new Command()
   .command("config", configCommand)
   .reset()
   .command("alias", aliasCommand)
+  .reset()
+  .command("bd", bdCommand)
   .reset()
   .command("completions", new CompletionsCommand())
   .parse(Deno.args);
@@ -699,25 +748,14 @@ function addSessionOptions(
 
 async function runCreateCommand(rawOptions: RawCreateOptions) {
   let exitCode = 0;
-  let client: AppServerClient | undefined;
   try {
-    const options = await createOptions(rawOptions);
-    client = new AppServerClient(options.codexCommand, options.connect);
-    await client.start();
-    await client.initialize(options.timeoutMs);
-    const thread = await client.startThread(options);
-    const turn = thread.id && options.message
-      ? await client.startTurn(thread.id, options.message, options)
-      : undefined;
-
+    const { thread, turn, options } = await createSession(rawOptions);
     printCreateResult({ thread, turn, options });
   } catch (error) {
     exitCode = 1;
     printError(error);
-  } finally {
-    await client?.close();
-    Deno.exit(exitCode);
   }
+  Deno.exit(exitCode);
 }
 
 async function runAction(action: () => Promise<void>) {
@@ -726,6 +764,228 @@ async function runAction(action: () => Promise<void>) {
   } catch (error) {
     printError(error);
     Deno.exit(1);
+  }
+}
+
+async function runBdStackCommand(repoName: string, rawOptions: RawCreateOptions) {
+  const tasks = parseTaskList(asString(rawOptions.tasks));
+  const limit = asNumber(rawOptions.limit);
+  if (limit !== undefined && limit <= 0) throw new Error("--limit must be greater than 0.");
+  const selectedTasks = limit === undefined ? tasks : tasks.slice(0, limit);
+  const base = asString(rawOptions.base) ?? "main";
+  const plan = planBdStack(selectedTasks, base);
+
+  if (rawOptions.dryRun === true) {
+    printBdStackPlan(plan);
+    return;
+  }
+
+  const repo = await resolveRepo(repoName);
+  const waitMs = asNumber(rawOptions.waitMs) ?? DEFAULT_BD_STACK_WAIT_MS;
+  if (waitMs < 0) throw new Error("--wait-ms must be zero or greater.");
+
+  for (let index = 0; index < plan.length; index++) {
+    const item = plan[index];
+    if (index > 0) {
+      await waitForBdPrReady(repo.path, plan[index - 1].task, waitMs);
+    }
+
+    await bdUpdate(repo.path, item.task, ["--claim"]);
+    await bdUpdateMetadata(repo.path, item.task, {
+      "cola.branch": item.branch,
+      "cola.base_branch": item.baseBranch,
+      "cola.state": "session-starting",
+    });
+
+    const message = buildBdStackPrompt(item);
+    const { thread, turn, options } = await createSession({
+      ...rawOptions,
+      json: false,
+      message,
+      worktree: repoName,
+      branch: item.baseBranch,
+      newBranch: item.branch,
+      cwd: Deno.cwd(),
+    });
+
+    const sessionId = thread.id;
+    if (!sessionId) throw new Error(`Codex did not return a session id for ${item.task}.`);
+    const worktreePath = options.worktreeInfo?.path;
+    if (!worktreePath) throw new Error(`Worktree was not created for ${item.task}.`);
+
+    await bdUpdateMetadata(repo.path, item.task, {
+      "cola.session_id": sessionId,
+      "cola.worktree": worktreePath,
+      "cola.branch": item.branch,
+      "cola.base_branch": item.baseBranch,
+      "cola.state": "session-started",
+    });
+
+    console.log(`Started ${item.task}`);
+    console.log(`  session: ${sessionId}`);
+    if (turn?.id) console.log(`  turn: ${turn.id}`);
+    console.log(`  worktree: ${worktreePath}`);
+    console.log(`  branch: ${item.branch}`);
+    console.log(`  base: ${item.baseBranch}`);
+  }
+}
+
+function parseTaskList(value: string | undefined): string[] {
+  if (!value) throw new Error("--tasks is required.");
+  const tasks = value.split(",").map((task) => task.trim()).filter(Boolean);
+  if (tasks.length === 0) throw new Error("--tasks must include at least one task id.");
+  const seen = new Set<string>();
+  for (const task of tasks) {
+    if (seen.has(task)) throw new Error(`Duplicate task id in --tasks: ${task}`);
+    seen.add(task);
+  }
+  return tasks;
+}
+
+function planBdStack(tasks: string[], baseBranch: string): BdStackTask[] {
+  const plan: BdStackTask[] = [];
+  let currentBase = baseBranch;
+  for (const task of tasks) {
+    const branch = `bd/${sanitizeBranchPart(task)}`;
+    plan.push({ task, branch, baseBranch: currentBase });
+    currentBase = branch;
+  }
+  return plan;
+}
+
+function printBdStackPlan(plan: BdStackTask[]) {
+  console.log("TASK\tBRANCH\tBASE");
+  for (const item of plan) {
+    console.log(`${item.task}\t${item.branch}\t${item.baseBranch}`);
+  }
+}
+
+function buildBdStackPrompt(item: BdStackTask): string {
+  return [
+    `Implement bd task ${item.task}.`,
+    "",
+    "You are working in a dedicated git worktree and branch for this task.",
+    "",
+    "Stack context:",
+    `- Task: ${item.task}`,
+    `- Branch: ${item.branch}`,
+    `- Base branch: ${item.baseBranch}`,
+    "",
+    "Instructions:",
+    `- Run \`bd show ${item.task} --long\` first and keep the change scoped to that task.`,
+    "- Implement the requested change.",
+    "- Run the relevant checks for the repository.",
+    "- Commit the completed work on this branch.",
+    "- Push the branch.",
+    `- Create a PR with base \`${item.baseBranch}\` and head \`${item.branch}\`.`,
+    "- Do not merge the PR.",
+    "- After opening the PR, update bd metadata with:",
+    `  - \`bd update ${item.task} --set-metadata cola.pr_url=<PR URL> --set-metadata cola.state=pr-opened\``,
+    "- Leave human review and merge manual.",
+  ].join("\n");
+}
+
+async function waitForBdPrReady(repoPath: string, task: string, timeoutMs: number) {
+  const deadline = timeoutMs === 0 ? undefined : Date.now() + timeoutMs;
+  while (deadline === undefined || Date.now() <= deadline) {
+    const issue = await bdShow(repoPath, task);
+    const metadata = issueMetadata(issue);
+    if (metadata["cola.state"] === "pr-opened" || typeof metadata["cola.pr_url"] === "string") {
+      return;
+    }
+    await delay(2_000);
+  }
+
+  throw new Error(
+    `Timed out waiting for ${task} to reach cola.state=pr-opened or cola.pr_url.`,
+  );
+}
+
+async function bdShow(repoPath: string, task: string): Promise<BdIssue> {
+  const output = await runBd(repoPath, ["show", task, "--json"]);
+  const parsed = JSON.parse(output);
+  if (Array.isArray(parsed)) return asRecord(parsed[0] ?? {}) as BdIssue;
+  return asRecord(parsed) as BdIssue;
+}
+
+async function bdUpdate(repoPath: string, task: string, args: string[]) {
+  await runBd(repoPath, ["update", task, ...args]);
+}
+
+async function bdUpdateMetadata(
+  repoPath: string,
+  task: string,
+  metadata: Record<string, string>,
+) {
+  const args = Object.entries(metadata).flatMap(([key, value]) => [
+    "--set-metadata",
+    `${key}=${value}`,
+  ]);
+  await bdUpdate(repoPath, task, args);
+}
+
+async function runBd(repoPath: string, args: string[]): Promise<string> {
+  const command = new Deno.Command("bd", {
+    args,
+    cwd: repoPath,
+    stdout: "piped",
+    stderr: "piped",
+  });
+  const output = await command.output();
+  const stdout = new TextDecoder().decode(output.stdout);
+  const stderr = new TextDecoder().decode(output.stderr).trim();
+  if (!output.success) throw new Error(stderr || `bd ${args.join(" ")} failed`);
+  return stdout;
+}
+
+function issueMetadata(issue: BdIssue): Record<string, unknown> {
+  if (isRecord(issue.metadata)) return issue.metadata;
+  const found = findMetadata(issue);
+  return isRecord(found) ? found : {};
+}
+
+function findMetadata(value: unknown): unknown {
+  if (!isRecord(value)) return undefined;
+  if (isRecord(value.metadata)) return value.metadata;
+  if (isRecord(value.Metadata)) return value.Metadata;
+  for (const child of Object.values(value)) {
+    const found = findMetadata(child);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function sanitizeBranchPart(value: string): string {
+  const sanitized = value.toLowerCase().replace(/[^a-z0-9._/-]+/g, "-").replace(/^\/+|\/+$/g, "")
+    .replace(/\/{2,}/g, "/");
+  if (!sanitized || sanitized === "." || sanitized === "..") {
+    throw new Error(`Cannot derive branch name from task id: ${value}`);
+  }
+  return sanitized;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function createSession(rawOptions: RawCreateOptions): Promise<{
+  thread: ThreadSummary;
+  turn?: TurnSummary;
+  options: CreateOptions;
+}> {
+  let client: AppServerClient | undefined;
+  const options = await createOptions(rawOptions);
+  try {
+    client = new AppServerClient(options.codexCommand, options.connect);
+    await client.start();
+    await client.initialize(options.timeoutMs);
+    const thread = await client.startThread(options);
+    const turn = thread.id && options.message
+      ? await client.startTurn(thread.id, options.message, options)
+      : undefined;
+    return { thread, turn, options };
+  } finally {
+    await client?.close();
   }
 }
 
