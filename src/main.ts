@@ -80,6 +80,18 @@ type BdStackTask = {
   baseBranch: string;
 };
 
+type BdRunTask = BdStackTask & {
+  runId: string;
+  order: number;
+  strategy: "stacked";
+  previousTask: string;
+  nextTask: string;
+  state: string;
+  sessionId?: string;
+  prUrl?: string;
+  worktree?: string;
+};
+
 type BdIssue = {
   id?: string;
   title?: string;
@@ -90,6 +102,7 @@ type BdIssue = {
 const DEFAULT_CODEX_COMMAND = "codex";
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_BD_STACK_WAIT_MS = 0;
+const DEFAULT_BD_RUN_STRATEGY = "stacked";
 
 const CLIENT_INFO = {
   name: "cola",
@@ -650,6 +663,34 @@ const aliasCommand = new Command()
 
 const bdCommand = new Command()
   .description("Run bd-backed Cola task automation.")
+  .command(
+    "run",
+    new Command()
+      .description("Plan and inspect ordered bd task-list runs.")
+      .command("create <repo:string>", "Create a metadata-only ordered bd run.")
+      .option("--tasks <tasks:string>", "Explicit ordered comma-separated bd task IDs.")
+      .option("--base <branch:string>", "Base branch for the first task.", { default: "main" })
+      .action(async (rawOptions: RawCreateOptions, repo: string) => {
+        await runAction(async () => {
+          await runBdRunCreateCommand(repo, rawOptions);
+        });
+      })
+      .reset()
+      .command("plan <runId:string>", "Show the planned task order for a bd run.")
+      .action(async (_options: void, runId: string) => {
+        await runAction(async () => {
+          await runBdRunPlanCommand(runId);
+        });
+      })
+      .reset()
+      .command("status <runId:string>", "Show task states and known metadata for a bd run.")
+      .action(async (_options: void, runId: string) => {
+        await runAction(async () => {
+          await runBdRunStatusCommand(runId);
+        });
+      }),
+  )
+  .reset()
   .command("stack <repo:string>", "Start one Codex session per bd task as a stacked PR chain.")
   .type("approval-policy", approvalPolicyType)
   .type("sandbox", sandboxType)
@@ -767,6 +808,33 @@ async function runAction(action: () => Promise<void>) {
   }
 }
 
+async function runBdRunCreateCommand(repoName: string, rawOptions: RawCreateOptions) {
+  const tasks = parseTaskList(asString(rawOptions.tasks));
+  const base = asString(rawOptions.base) ?? "main";
+  const repo = await resolveRepo(repoName);
+  const runId = createBdRunId(tasks, base);
+  const plan = planBdRun(tasks, base, runId);
+
+  for (const item of plan) {
+    await bdUpdateMetadata(repo.path, item.task, bdRunMetadata(item));
+  }
+
+  console.log(`Created bd run: ${runId}`);
+  console.log(`Strategy: ${DEFAULT_BD_RUN_STRATEGY}`);
+  console.log(`Base: ${base}`);
+  printBdRunPlan(plan);
+}
+
+async function runBdRunPlanCommand(runId: string) {
+  const plan = await loadBdRun(Deno.cwd(), runId);
+  printBdRunPlan(plan);
+}
+
+async function runBdRunStatusCommand(runId: string) {
+  const plan = await loadBdRun(Deno.cwd(), runId);
+  printBdRunStatus(plan);
+}
+
 async function runBdStackCommand(repoName: string, rawOptions: RawCreateOptions) {
   const tasks = parseTaskList(asString(rawOptions.tasks));
   const limit = asNumber(rawOptions.limit);
@@ -853,10 +921,57 @@ function planBdStack(tasks: string[], baseBranch: string): BdStackTask[] {
   return plan;
 }
 
+function planBdRun(tasks: string[], baseBranch: string, runId: string): BdRunTask[] {
+  return planBdStack(tasks, baseBranch).map((item, index, plan) => ({
+    ...item,
+    runId,
+    order: index + 1,
+    strategy: DEFAULT_BD_RUN_STRATEGY,
+    previousTask: plan[index - 1]?.task ?? "",
+    nextTask: plan[index + 1]?.task ?? "",
+    state: "planned",
+  }));
+}
+
 function printBdStackPlan(plan: BdStackTask[]) {
   console.log("TASK\tBRANCH\tBASE");
   for (const item of plan) {
     console.log(`${item.task}\t${item.branch}\t${item.baseBranch}`);
+  }
+}
+
+function printBdRunPlan(plan: BdRunTask[]) {
+  console.log("ORDER\tTASK\tSTRATEGY\tBRANCH\tBASE\tPREVIOUS\tNEXT");
+  for (const item of plan) {
+    console.log(
+      [
+        item.order,
+        item.task,
+        item.strategy,
+        item.branch,
+        item.baseBranch,
+        item.previousTask || "-",
+        item.nextTask || "-",
+      ].join("\t"),
+    );
+  }
+}
+
+function printBdRunStatus(plan: BdRunTask[]) {
+  console.log("ORDER\tTASK\tSTATE\tSESSION\tPR\tWORKTREE\tBRANCH\tBASE");
+  for (const item of plan) {
+    console.log(
+      [
+        item.order,
+        item.task,
+        item.state || "planned",
+        item.sessionId || "-",
+        item.prUrl || "-",
+        item.worktree || "-",
+        item.branch,
+        item.baseBranch,
+      ].join("\t"),
+    );
   }
 }
 
@@ -908,6 +1023,11 @@ async function bdShow(repoPath: string, task: string): Promise<BdIssue> {
   return asRecord(parsed) as BdIssue;
 }
 
+async function bdList(repoPath: string): Promise<BdIssue[]> {
+  const output = await runBd(repoPath, ["list", "--json"]);
+  return collectBdIssues(JSON.parse(output));
+}
+
 async function bdUpdate(repoPath: string, task: string, args: string[]) {
   await runBd(repoPath, ["update", task, ...args]);
 }
@@ -922,6 +1042,80 @@ async function bdUpdateMetadata(
     `${key}=${value}`,
   ]);
   await bdUpdate(repoPath, task, args);
+}
+
+async function loadBdRun(repoPath: string, runId: string): Promise<BdRunTask[]> {
+  const issues = await bdList(repoPath);
+  const plan = issues.flatMap((issue) => bdRunTaskFromIssue(issue, runId));
+  plan.sort((left, right) => left.order - right.order || left.task.localeCompare(right.task));
+  if (plan.length === 0) {
+    throw new Error(`No bd run metadata found for run id: ${runId}`);
+  }
+  return plan;
+}
+
+function bdRunMetadata(item: BdRunTask): Record<string, string> {
+  return {
+    "cola.run_id": item.runId,
+    "cola.run_order": String(item.order),
+    "cola.strategy": item.strategy,
+    "cola.branch": item.branch,
+    "cola.base_branch": item.baseBranch,
+    "cola.previous_task": item.previousTask,
+    "cola.next_task": item.nextTask,
+    "cola.state": item.state,
+  };
+}
+
+function bdRunTaskFromIssue(issue: BdIssue, runId: string): BdRunTask[] {
+  const metadata = issueMetadata(issue);
+  if (metadata["cola.run_id"] !== runId) return [];
+
+  const task = issueId(issue);
+  const order = Number(metadata["cola.run_order"]);
+  const strategy = metadata["cola.strategy"];
+  const branch = asMetadataString(metadata["cola.branch"]);
+  const baseBranch = asMetadataString(metadata["cola.base_branch"]);
+  if (!task || !Number.isInteger(order) || order <= 0 || strategy !== DEFAULT_BD_RUN_STRATEGY) {
+    return [];
+  }
+  if (!branch || !baseBranch) return [];
+
+  return [{
+    task,
+    runId,
+    order,
+    strategy: DEFAULT_BD_RUN_STRATEGY,
+    branch,
+    baseBranch,
+    previousTask: asMetadataString(metadata["cola.previous_task"]) ?? "",
+    nextTask: asMetadataString(metadata["cola.next_task"]) ?? "",
+    state: asMetadataString(metadata["cola.state"]) ?? "planned",
+    sessionId: asMetadataString(metadata["cola.session_id"]),
+    prUrl: asMetadataString(metadata["cola.pr_url"]),
+    worktree: asMetadataString(metadata["cola.worktree"]),
+  }];
+}
+
+function collectBdIssues(value: unknown): BdIssue[] {
+  if (Array.isArray(value)) return value.flatMap(collectBdIssues);
+  if (!isRecord(value)) return [];
+  if (issueId(value) && isRecord(findMetadata(value))) return [value as BdIssue];
+
+  const likelyCollections = ["issues", "tasks", "items", "data", "results"];
+  for (const key of likelyCollections) {
+    const child = value[key];
+    const issues = collectBdIssues(child);
+    if (issues.length > 0) return issues;
+  }
+  return Object.values(value).flatMap(collectBdIssues);
+}
+
+function issueId(issue: Record<string, unknown>): string | undefined {
+  return asMetadataString(issue.id) ??
+    asMetadataString(issue.ID) ??
+    asMetadataString(issue.identifier) ??
+    asMetadataString(issue.name);
 }
 
 async function runBd(repoPath: string, args: string[]): Promise<string> {
@@ -962,6 +1156,13 @@ function sanitizeBranchPart(value: string): string {
     throw new Error(`Cannot derive branch name from task id: ${value}`);
   }
   return sanitized;
+}
+
+function createBdRunId(tasks: string[], baseBranch: string): string {
+  const suffix = crypto.randomUUID().slice(0, 8);
+  const firstTask = sanitizeBranchPart(tasks[0]).replace(/\//g, "-");
+  const base = sanitizeBranchPart(baseBranch).replace(/\//g, "-");
+  return `cola-${base}-${firstTask}-${suffix}`;
 }
 
 function delay(ms: number): Promise<void> {
@@ -1140,6 +1341,12 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function asMetadataString(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return undefined;
 }
 
 function asNumber(value: unknown): number | undefined {
