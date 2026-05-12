@@ -15,7 +15,7 @@ For task-focused CLI usage docs, start with [docs/README.md](docs/README.md).
 Install the CLI:
 
 ```sh
-deno install --global --config deno.json --allow-run=codex,ps,git,"$EDITOR" --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost --name cola ./src/main.ts
+deno install --global --config deno.json --allow-run=bd,codex,ps,git,"$EDITOR" --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost --name cola ./src/main.ts
 ```
 
 Open your editor, then create a session and send the saved text as the first message:
