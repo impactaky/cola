@@ -82,11 +82,14 @@ Choose the workspace or model:
 cola create --cwd "$PWD" --model gpt-5.4
 ```
 
-Connect to an app-server that is already listening on WebSocket:
+Connect to an app-server that is already listening on WebSocket or a Unix socket:
 
 ```sh
 codex app-server --listen ws://127.0.0.1:9234
 cola create --connect ws://127.0.0.1:9234 "Run tests"
+
+codex app-server --listen unix://
+cola create --connect unix:// "Run tests"
 ```
 
 Use a non-default Codex executable:
@@ -145,10 +148,24 @@ is not set. Use `--branch` to override the base branch for one run:
 cola worktree cola "test migration" --branch develop
 ```
 
+Use `--new-branch` when the worktree should be checked out on a named PR branch instead of detached:
+
+```sh
+cola worktree cola "implement API cleanup" --branch main --new-branch api-cleanup
+```
+
+For stacked PRs, keep `--branch` as the base branch selector and name the follow-up branch with
+`--new-branch`:
+
+```sh
+cola worktree cola "add follow-up UI" --branch api-cleanup --new-branch ui-follow-up
+```
+
 `create` can also prepare the worktree before creating the Codex session:
 
 ```sh
 cola create --worktree cola "implement config-backed worktrees"
+cola create --worktree cola --branch main --new-branch config-work "implement config work"
 ```
 
 ## How It Works
@@ -157,9 +174,10 @@ When `--connect` is omitted, `cola` looks for a running process like:
 
 ```sh
 codex app-server --listen ws://127.0.0.1:9234
+codex app-server --listen unix://
 ```
 
-If it finds a reachable local WebSocket endpoint, it reuses it. Otherwise it starts:
+If it finds a reachable local WebSocket or Unix-socket endpoint, it reuses it. Otherwise it starts:
 
 ```sh
 codex app-server

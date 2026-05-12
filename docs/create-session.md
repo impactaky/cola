@@ -45,6 +45,7 @@ Create a Codex app-server thread and optionally start its first turn.
 
 - A successful command prints `Created Codex session: <id>`.
 - If the first message is provided, output also includes `Started turn: <id>`.
-- `--json` prints an object with `thread`, `turn`, and `worktree` fields.
+- `--json` prints an object with `thread`, `turn`, and `worktree` fields. When a worktree is
+  created, `worktree` includes `path`, `branch`, and `baseBranch`.
 - If no message is provided, the editor opens and the saved text becomes the first message.
 - An empty editor buffer prints `Aborted: message is empty.`
