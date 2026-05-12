@@ -5,6 +5,7 @@
     "fmt": "deno fmt"
   },
   "fmt": {
+    "exclude": ["AGENTS.override.md", ".myagents/", "project-rules.md"],
     "lineWidth": 100,
     "semiColons": true,
     "singleQuote": false

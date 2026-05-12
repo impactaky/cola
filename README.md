@@ -148,10 +148,24 @@ is not set. Use `--branch` to override the base branch for one run:
 cola worktree cola "test migration" --branch develop
 ```
 
+Use `--new-branch` when the worktree should be checked out on a named PR branch instead of detached:
+
+```sh
+cola worktree cola "implement API cleanup" --branch main --new-branch api-cleanup
+```
+
+For stacked PRs, keep `--branch` as the base branch selector and name the follow-up branch with
+`--new-branch`:
+
+```sh
+cola worktree cola "add follow-up UI" --branch api-cleanup --new-branch ui-follow-up
+```
+
 `create` can also prepare the worktree before creating the Codex session:
 
 ```sh
 cola create --worktree cola "implement config-backed worktrees"
+cola create --worktree cola --branch main --new-branch config-work "implement config work"
 ```
 
 ## How It Works

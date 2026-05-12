@@ -51,6 +51,7 @@ type CreateOptions = {
   json: boolean;
   worktree?: string;
   branch?: string;
+  newBranch?: string;
   worktreeInfo?: WorktreeInfo;
 };
 
@@ -69,6 +70,7 @@ type RepoConfig = {
 type WorktreeInfo = {
   id: string;
   path: string;
+  branch: string | null;
   baseBranch: string;
 };
 
@@ -517,7 +519,7 @@ const createCommand = addSessionOptions(new Command(), { cwd: true, worktree: tr
     });
   });
 
-const worktreeCommand = addSessionOptions(new Command(), { branch: true })
+const worktreeCommand = addSessionOptions(new Command(), { branch: true, newBranch: true })
   .type("approval-policy", approvalPolicyType)
   .type("sandbox", sandboxType)
   .type("personality", personalityType)
@@ -656,7 +658,7 @@ await new Command()
 
 function addSessionOptions(
   command: Command,
-  options: { cwd?: boolean; worktree?: boolean; branch?: boolean } = {},
+  options: { cwd?: boolean; worktree?: boolean; branch?: boolean; newBranch?: boolean } = {},
 ): Command {
   command
     .option("--connect <url:string>", "Use an existing app-server ws:// or unix:// URL.")
@@ -680,13 +682,17 @@ function addSessionOptions(
   if (options.worktree) {
     command
       .option("--worktree <repo:string>", "Create a git worktree from a registered repo first.")
-      .option("--branch <branch:string>", "Base branch for --worktree. Defaults to main.");
+      .option("--branch <branch:string>", "Base branch for --worktree. Defaults to main.")
+      .option("--new-branch <branch:string>", "Create and check out a new worktree branch.");
   }
   if (options.branch) {
     command.option(
       "--branch <branch:string>",
       "Base branch for the new worktree. Defaults to main.",
     );
+  }
+  if (options.newBranch) {
+    command.option("--new-branch <branch:string>", "Create and check out a new worktree branch.");
   }
   return command;
 }
@@ -775,12 +781,18 @@ async function createOptions(rawOptions: RawCreateOptions): Promise<CreateOption
     json: rawOptions.json === true,
     worktree: asString(rawOptions.worktree),
     branch: asString(rawOptions.branch),
+    newBranch: asString(rawOptions.newBranch),
   };
   options.message ??= await promptMessageInEditor();
 
   if (options.worktree) {
     const description = options.message ?? "session";
-    const worktree = await createWorktree(options.worktree, description, options.branch);
+    const worktree = await createWorktree(
+      options.worktree,
+      description,
+      options.branch,
+      options.newBranch,
+    );
     options.cwd = worktree.path;
     options.worktreeInfo = worktree;
   }
@@ -834,6 +846,7 @@ function printCreateResult(
   if (options.worktreeInfo) {
     console.log(`Created worktree: ${options.worktreeInfo.path}`);
     console.log(`Worktree id: ${options.worktreeInfo.id}`);
+    console.log(`Branch: ${options.worktreeInfo.branch ?? "detached"}`);
     console.log(`Base branch: ${options.worktreeInfo.baseBranch}`);
   }
   if (options.connect) console.log(`Connected app-server: ${options.connect}`);
@@ -961,6 +974,7 @@ async function createWorktree(
   repoName: string,
   _description: string,
   branch?: string,
+  newBranch?: string,
 ): Promise<WorktreeInfo> {
   const repo = await resolveRepo(repoName);
   const id = await uniqueWorktreeId();
@@ -969,11 +983,15 @@ async function createWorktree(
   const path = `${parent}/${basename(repo.path)}`;
 
   await Deno.mkdir(parent, { recursive: true });
-  await runGit(["-C", repo.path, "worktree", "add", "--detach", path, baseBranch]);
+  const args = newBranch
+    ? ["-C", repo.path, "worktree", "add", "-b", newBranch, path, baseBranch]
+    : ["-C", repo.path, "worktree", "add", "--detach", path, baseBranch];
+  await runGit(args);
 
   return {
     id,
     path,
+    branch: newBranch ?? null,
     baseBranch,
   };
 }

@@ -35,13 +35,25 @@ Register repositories and create Codex sessions in new git worktrees.
    cola worktree cola "Test migration" --branch develop
    ```
 
-5. Create a worktree through `cola create`:
+5. Create and check out a named branch in the new worktree:
+
+   ```sh
+   cola worktree cola "Implement API cleanup" --branch main --new-branch api-cleanup
+   ```
+
+6. Create a branch stacked on top of another PR branch:
+
+   ```sh
+   cola worktree cola "Add follow-up UI" --branch api-cleanup --new-branch ui-follow-up
+   ```
+
+7. Create a worktree through `cola create`:
 
    ```sh
    cola create --worktree cola "Handle empty config"
    ```
 
-6. Remove a registered repository when it is no longer needed:
+8. Remove a registered repository when it is no longer needed:
 
    ```sh
    cola repo remove cola
@@ -51,8 +63,13 @@ Register repositories and create Codex sessions in new git worktrees.
 
 - `cola repo register` prints `Registered repo <name>: <path>`.
 - `cola repo list` prints each repository name, path, and branch separated by tabs.
-- Worktree commands print `Created worktree: <path>`, `Worktree id: <id>`, and
+- Without `--new-branch`, worktree commands keep the existing detached worktree behavior.
+- With `--new-branch`, worktree commands run `git worktree add -b <newBranch> <path> <baseBranch>`,
+  so the new branch starts at the requested base branch.
+- Worktree commands print `Created worktree: <path>`, `Worktree id: <id>`, `Branch: <branch>`, and
   `Base branch: <branch>`.
+- `--json` includes `worktree.path`, `worktree.branch`, and `worktree.baseBranch`. Detached
+  worktrees report `worktree.branch` as `null`.
 - Worktrees are created under `$CODEX_HOME/worktrees/<id>/<repo-name>`, or
   `~/.codex/worktrees/<id>/<repo-name>` when `CODEX_HOME` is unset.
 - The Codex session working directory is the new worktree path.
