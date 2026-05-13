@@ -168,6 +168,21 @@ cola create --worktree cola "implement config-backed worktrees"
 cola create --worktree cola --branch main --new-branch config-work "implement config work"
 ```
 
+## bd Ready Workflow
+
+Register the repository once, then let bd choose the next ready task:
+
+```sh
+cola repo register cola /path/to/repo --branch main
+cola bd next cola
+```
+
+`cola bd next` runs `bd ready --json --limit 1`. If no ready task exists, it prints that no ready bd
+tasks were found and exits without creating a worktree or session. When a ready task exists, it
+claims the task, creates one named branch with `cola worktree` behavior, starts one Codex session,
+and stores the session, turn, worktree, branch, base branch, and `cola.state=session-started` in bd
+metadata.
+
 ## How It Works
 
 When `--connect` is omitted, `cola` looks for a running process like:
