@@ -1,4 +1,4 @@
-#!/usr/bin/env -S deno run --allow-run=bd,codex,ps,git,vi --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost
+#!/usr/bin/env -S deno run --allow-run=bd,codex,ps,git,vi,gh --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost
 
 import { Command, EnumType } from "@cliffy/command";
 import { CompletionsCommand } from "@cliffy/command/completions";
@@ -80,6 +80,16 @@ type BdNextTask = {
   baseBranch: string;
 };
 
+type BdNextResult = {
+  task: string;
+  repoPath: string;
+};
+
+type BdWaitPrOptions = {
+  timeoutSeconds: number;
+  pollIntervalSeconds: number;
+};
+
 type BdIssue = {
   id?: string;
   title?: string;
@@ -89,6 +99,8 @@ type BdIssue = {
 
 const DEFAULT_CODEX_COMMAND = "codex";
 const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_BD_WAIT_PR_TIMEOUT_SECONDS = 30 * 60;
+const DEFAULT_BD_WAIT_PR_POLL_INTERVAL_SECONDS = 10;
 
 const CLIENT_INFO = {
   name: "cola",
@@ -665,9 +677,32 @@ const bdCommand = new Command()
   .option("--timeout-ms <ms:integer>", "Request timeout in milliseconds.", {
     default: DEFAULT_TIMEOUT_MS,
   })
+  .option("--wait-pr", "Wait until the selected task records an open PR.", { default: false })
+  .option("--timeout <seconds:integer>", "Seconds to wait for PR metadata.", {
+    default: DEFAULT_BD_WAIT_PR_TIMEOUT_SECONDS,
+  })
+  .option("--poll-interval <seconds:integer>", "Seconds between bd show polls.", {
+    default: DEFAULT_BD_WAIT_PR_POLL_INTERVAL_SECONDS,
+  })
   .action(async (rawOptions: RawCreateOptions, repo: string) => {
     await runAction(async () => {
-      await runBdNextCommand(repo, rawOptions);
+      const result = await runBdNextCommand(repo, rawOptions);
+      if (rawOptions.waitPr === true && result) {
+        await runBdWaitPr(result.task, rawOptions, result.repoPath);
+      }
+    });
+  })
+  .reset()
+  .command("wait-pr <task-id:string>", "Wait until a bd task records an opened PR.")
+  .option("--timeout <seconds:integer>", "Seconds to wait for PR metadata.", {
+    default: DEFAULT_BD_WAIT_PR_TIMEOUT_SECONDS,
+  })
+  .option("--poll-interval <seconds:integer>", "Seconds between bd show polls.", {
+    default: DEFAULT_BD_WAIT_PR_POLL_INTERVAL_SECONDS,
+  })
+  .action(async (rawOptions: RawCreateOptions, taskId: string) => {
+    await runAction(async () => {
+      await runBdWaitPr(taskId, rawOptions, Deno.cwd());
     });
   })
   .reset();
@@ -758,12 +793,15 @@ async function runAction(action: () => Promise<void>) {
   }
 }
 
-async function runBdNextCommand(repoName: string, rawOptions: RawCreateOptions) {
+async function runBdNextCommand(
+  repoName: string,
+  rawOptions: RawCreateOptions,
+): Promise<BdNextResult | undefined> {
   const repo = await resolveRepo(repoName);
   const issue = await bdReadyOne(repo.path);
   if (!issue) {
     console.log("No ready bd tasks found.");
-    return;
+    return undefined;
   }
 
   const task = bdIssueId(issue);
@@ -812,12 +850,73 @@ async function runBdNextCommand(repoName: string, rawOptions: RawCreateOptions) 
   console.log(`  worktree: ${worktreePath}`);
   console.log(`  branch: ${item.branch}`);
   console.log(`  base: ${baseBranch}`);
+  return { task: item.task, repoPath: repo.path };
+}
+
+async function runBdWaitPr(
+  task: string,
+  rawOptions: RawCreateOptions,
+  repoPath: string,
+) {
+  const options = bdWaitPrOptions(rawOptions);
+  const result = await waitForBdPr(repoPath, task, options);
+  console.log(`PR recorded for ${task}: ${result.prUrl ?? "cola.state=pr-opened"}`);
+  if (result.prUrl) {
+    await verifyPrUrlWithGh(result.prUrl);
+  }
+}
+
+function bdWaitPrOptions(rawOptions: RawCreateOptions): BdWaitPrOptions {
+  const timeoutSeconds = asNumber(rawOptions.timeout) ?? DEFAULT_BD_WAIT_PR_TIMEOUT_SECONDS;
+  const pollIntervalSeconds = asNumber(rawOptions.pollInterval) ??
+    DEFAULT_BD_WAIT_PR_POLL_INTERVAL_SECONDS;
+  if (timeoutSeconds <= 0) throw new Error("--timeout must be greater than 0.");
+  if (pollIntervalSeconds <= 0) throw new Error("--poll-interval must be greater than 0.");
+  return { timeoutSeconds, pollIntervalSeconds };
+}
+
+async function waitForBdPr(
+  repoPath: string,
+  task: string,
+  options: BdWaitPrOptions,
+): Promise<{ prUrl?: string }> {
+  const deadline = Date.now() + options.timeoutSeconds * 1000;
+  let lastState = "";
+
+  while (true) {
+    const issue = await bdShow(repoPath, task);
+    const state = bdMetadataString(issue, "cola.state");
+    const prUrl = bdMetadataString(issue, "cola.pr_url");
+    lastState = state ?? "";
+
+    if (state === "failed") {
+      throw new Error(`bd task ${task} recorded cola.state=failed.`);
+    }
+    if (state === "pr-opened" || prUrl) {
+      return { prUrl };
+    }
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      const suffix = lastState ? ` Last cola.state=${lastState}.` : "";
+      throw new Error(
+        `Timed out waiting ${options.timeoutSeconds}s for ${task} to record cola.state=pr-opened or cola.pr_url.${suffix}`,
+      );
+    }
+
+    await sleep(Math.min(options.pollIntervalSeconds * 1000, remainingMs));
+  }
 }
 
 async function bdReadyOne(repoPath: string): Promise<BdIssue | undefined> {
   const output = await runBd(repoPath, ["ready", "--json", "--limit", "1"]);
   const parsed = JSON.parse(output);
   return firstBdIssue(parsed);
+}
+
+async function bdShow(repoPath: string, task: string): Promise<Record<string, unknown>> {
+  const output = await runBd(repoPath, ["show", task, "--json"]);
+  return asRecord(JSON.parse(output));
 }
 
 function firstBdIssue(value: unknown): BdIssue | undefined {
@@ -896,6 +995,61 @@ async function runBd(repoPath: string, args: string[]): Promise<string> {
   const stderr = new TextDecoder().decode(output.stderr).trim();
   if (!output.success) throw new Error(stderr || `bd ${args.join(" ")} failed`);
   return stdout;
+}
+
+function bdMetadataString(issue: Record<string, unknown>, key: string): string | undefined {
+  const direct = asNonEmptyString(issue[key]);
+  if (direct) return direct;
+
+  const metadata = issue.metadata;
+  if (isRecord(metadata)) {
+    const metadataDirect = asNonEmptyString(metadata[key]);
+    if (metadataDirect) return metadataDirect;
+  }
+
+  const dotted = key.split(".");
+  return asNonEmptyString(readPath(issue, dotted)) ??
+    (isRecord(metadata) ? asNonEmptyString(readPath(metadata, dotted)) : undefined);
+}
+
+function readPath(value: unknown, path: string[]): unknown {
+  let current = value;
+  for (const part of path) {
+    if (!isRecord(current)) return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function asNonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+async function verifyPrUrlWithGh(prUrl: string) {
+  let output: Deno.CommandOutput;
+  try {
+    const command = new Deno.Command("gh", {
+      args: ["pr", "view", prUrl, "--json", "url,state"],
+      stdout: "piped",
+      stderr: "piped",
+    });
+    output = await command.output();
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) return;
+    throw error;
+  }
+
+  if (output.success) {
+    console.log(`Verified PR with gh: ${prUrl}`);
+    return;
+  }
+
+  const stderr = new TextDecoder().decode(output.stderr).trim();
+  console.error(`Warning: gh pr view could not verify ${prUrl}${stderr ? `: ${stderr}` : "."}`);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function sanitizeBranchPart(value: string): string {
@@ -1061,6 +1215,8 @@ function printError(error: unknown) {
 
   if (message.includes("No such file or directory") || message.includes("os error 2")) {
     console.error("Hint: install Codex or pass --codex-command /path/to/codex.");
+  } else if (message.includes("record cola.state=pr-opened or cola.pr_url")) {
+    console.error("Hint: increase --timeout or check the task session status.");
   } else if (message.includes("read-only") || message.includes("Readonly")) {
     console.error("Hint: set CODEX_HOME to a writable directory before running cola.");
   } else if (message.includes("Timed out")) {

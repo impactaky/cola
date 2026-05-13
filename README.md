@@ -174,7 +174,11 @@ Register the repository once, then let bd choose the next ready task:
 
 ```sh
 cola repo register cola /path/to/repo --branch main
-cola bd next cola
+bd ready
+cola bd next cola --wait-pr
+# human review and merge
+bd close <task-id>
+bd ready
 ```
 
 `cola bd next` runs `bd ready --json --limit 1`. If no ready task exists, it prints that no ready bd
@@ -182,6 +186,12 @@ tasks were found and exits without creating a worktree or session. When a ready 
 claims the task, creates one named branch with `cola worktree` behavior, starts one Codex session,
 and stores the session, turn, worktree, branch, base branch, and `cola.state=session-started` in bd
 metadata.
+
+Use `cola bd wait-pr <task-id>` to wait for a started task to record `cola.state=pr-opened` or
+`cola.pr_url` in `bd show <task-id> --json`. It fails on `cola.state=failed`, and supports
+`--timeout <seconds>` and `--poll-interval <seconds>`. `cola bd next <repo> --wait-pr` starts the
+next ready task and waits for that same task's PR metadata. Cola does not merge PRs or close bd
+tasks.
 
 ## How It Works
 
