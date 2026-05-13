@@ -74,7 +74,7 @@ type WorktreeInfo = {
   baseBranch: string;
 };
 
-type BdStackTask = {
+type BdNextTask = {
   task: string;
   branch: string;
   baseBranch: string;
@@ -89,7 +89,6 @@ type BdIssue = {
 
 const DEFAULT_CODEX_COMMAND = "codex";
 const DEFAULT_TIMEOUT_MS = 15_000;
-const DEFAULT_BD_STACK_WAIT_MS = 0;
 
 const CLIENT_INFO = {
   name: "cola",
@@ -650,14 +649,11 @@ const aliasCommand = new Command()
 
 const bdCommand = new Command()
   .description("Run bd-backed Cola task automation.")
-  .command("stack <repo:string>", "Start one Codex session per bd task as a stacked PR chain.")
+  .command("next <repo:string>", "Start one Codex session for the next ready bd task.")
   .type("approval-policy", approvalPolicyType)
   .type("sandbox", sandboxType)
   .type("personality", personalityType)
-  .option("--tasks <tasks:string>", "Explicit ordered comma-separated bd task IDs.")
-  .option("--base <branch:string>", "Base branch for the first task.", { default: "main" })
-  .option("--limit <count:integer>", "Limit how many tasks from --tasks to start.")
-  .option("--dry-run", "Print the planned stack without side effects.", { default: false })
+  .option("--base <branch:string>", "Base branch for the task worktree.")
   .option("--connect <url:string>", "Use an existing app-server ws:// or unix:// URL.")
   .option("--codex-command <command:string>", "Codex executable to run.", {
     default: DEFAULT_CODEX_COMMAND,
@@ -669,14 +665,9 @@ const bdCommand = new Command()
   .option("--timeout-ms <ms:integer>", "Request timeout in milliseconds.", {
     default: DEFAULT_TIMEOUT_MS,
   })
-  .option(
-    "--wait-ms <ms:integer>",
-    "Maximum inter-task wait for previous PR metadata. Defaults to 0, which waits forever.",
-    { default: DEFAULT_BD_STACK_WAIT_MS },
-  )
   .action(async (rawOptions: RawCreateOptions, repo: string) => {
     await runAction(async () => {
-      await runBdStackCommand(repo, rawOptions);
+      await runBdNextCommand(repo, rawOptions);
     });
   })
   .reset();
@@ -767,106 +758,98 @@ async function runAction(action: () => Promise<void>) {
   }
 }
 
-async function runBdStackCommand(repoName: string, rawOptions: RawCreateOptions) {
-  const tasks = parseTaskList(asString(rawOptions.tasks));
-  const limit = asNumber(rawOptions.limit);
-  if (limit !== undefined && limit <= 0) throw new Error("--limit must be greater than 0.");
-  const selectedTasks = limit === undefined ? tasks : tasks.slice(0, limit);
-  const base = asString(rawOptions.base) ?? "main";
-  const plan = planBdStack(selectedTasks, base);
-
-  if (rawOptions.dryRun === true) {
-    printBdStackPlan(plan);
+async function runBdNextCommand(repoName: string, rawOptions: RawCreateOptions) {
+  const repo = await resolveRepo(repoName);
+  const issue = await bdReadyOne(repo.path);
+  if (!issue) {
+    console.log("No ready bd tasks found.");
     return;
   }
 
-  const repo = await resolveRepo(repoName);
-  const waitMs = asNumber(rawOptions.waitMs) ?? DEFAULT_BD_STACK_WAIT_MS;
-  if (waitMs < 0) throw new Error("--wait-ms must be zero or greater.");
-
-  for (let index = 0; index < plan.length; index++) {
-    const item = plan[index];
-    if (index > 0) {
-      await waitForBdPrReady(repo.path, plan[index - 1].task, waitMs);
-    }
-
-    await bdUpdate(repo.path, item.task, ["--claim"]);
-    await bdUpdateMetadata(repo.path, item.task, {
-      "cola.branch": item.branch,
-      "cola.base_branch": item.baseBranch,
-      "cola.state": "session-starting",
-    });
-
-    const message = buildBdStackPrompt(item);
-    const { thread, turn, options } = await createSession({
-      ...rawOptions,
-      json: false,
-      message,
-      worktree: repoName,
-      branch: item.baseBranch,
-      newBranch: item.branch,
-      cwd: Deno.cwd(),
-    });
-
-    const sessionId = thread.id;
-    if (!sessionId) throw new Error(`Codex did not return a session id for ${item.task}.`);
-    const worktreePath = options.worktreeInfo?.path;
-    if (!worktreePath) throw new Error(`Worktree was not created for ${item.task}.`);
-
-    await bdUpdateMetadata(repo.path, item.task, {
-      "cola.session_id": sessionId,
-      "cola.worktree": worktreePath,
-      "cola.branch": item.branch,
-      "cola.base_branch": item.baseBranch,
-      "cola.state": "session-started",
-    });
-
-    console.log(`Started ${item.task}`);
-    console.log(`  session: ${sessionId}`);
-    if (turn?.id) console.log(`  turn: ${turn.id}`);
-    console.log(`  worktree: ${worktreePath}`);
-    console.log(`  branch: ${item.branch}`);
-    console.log(`  base: ${item.baseBranch}`);
+  const task = bdIssueId(issue);
+  if (!task) {
+    throw new Error(`bd ready --json did not return a task id: ${stringify(issue)}`);
   }
+  const item: BdNextTask = {
+    task,
+    branch: `bd/${sanitizeBranchPart(task)}`,
+    baseBranch: asString(rawOptions.base) ?? repo.branch ?? "main",
+  };
+
+  await bdUpdate(repo.path, item.task, ["--claim"]);
+
+  const message = buildBdNextPrompt(item);
+  const { thread, turn, options } = await createSession({
+    ...rawOptions,
+    json: false,
+    message,
+    worktree: repoName,
+    branch: item.baseBranch,
+    newBranch: item.branch,
+    cwd: Deno.cwd(),
+  });
+
+  const sessionId = thread.id;
+  if (!sessionId) throw new Error(`Codex did not return a session id for ${item.task}.`);
+  const turnId = turn?.id;
+  if (!turnId) throw new Error(`Codex did not return a turn id for ${item.task}.`);
+  const worktreePath = options.worktreeInfo?.path;
+  if (!worktreePath) throw new Error(`Worktree was not created for ${item.task}.`);
+  const baseBranch = options.worktreeInfo?.baseBranch ?? item.baseBranch;
+
+  await bdUpdateMetadata(repo.path, item.task, {
+    "cola.session_id": sessionId,
+    "cola.turn_id": turnId,
+    "cola.worktree": worktreePath,
+    "cola.branch": item.branch,
+    "cola.base_branch": baseBranch,
+    "cola.state": "session-started",
+  });
+
+  console.log(`Started ${item.task}`);
+  console.log(`  session: ${sessionId}`);
+  console.log(`  turn: ${turnId}`);
+  console.log(`  worktree: ${worktreePath}`);
+  console.log(`  branch: ${item.branch}`);
+  console.log(`  base: ${baseBranch}`);
 }
 
-function parseTaskList(value: string | undefined): string[] {
-  if (!value) throw new Error("--tasks is required.");
-  const tasks = value.split(",").map((task) => task.trim()).filter(Boolean);
-  if (tasks.length === 0) throw new Error("--tasks must include at least one task id.");
-  const seen = new Set<string>();
-  for (const task of tasks) {
-    if (seen.has(task)) throw new Error(`Duplicate task id in --tasks: ${task}`);
-    seen.add(task);
-  }
-  return tasks;
+async function bdReadyOne(repoPath: string): Promise<BdIssue | undefined> {
+  const output = await runBd(repoPath, ["ready", "--json", "--limit", "1"]);
+  const parsed = JSON.parse(output);
+  return firstBdIssue(parsed);
 }
 
-function planBdStack(tasks: string[], baseBranch: string): BdStackTask[] {
-  const plan: BdStackTask[] = [];
-  let currentBase = baseBranch;
-  for (const task of tasks) {
-    const branch = `bd/${sanitizeBranchPart(task)}`;
-    plan.push({ task, branch, baseBranch: currentBase });
-    currentBase = branch;
+function firstBdIssue(value: unknown): BdIssue | undefined {
+  if (Array.isArray(value)) {
+    const first = value.find((item) => isRecord(item) && bdIssueId(item));
+    return first ? first as BdIssue : undefined;
   }
-  return plan;
+  if (!isRecord(value)) return undefined;
+  if (bdIssueId(value)) return value as BdIssue;
+
+  for (const key of ["issues", "items", "tasks", "ready", "results"]) {
+    const nested = firstBdIssue(value[key]);
+    if (nested) return nested;
+  }
+  return undefined;
 }
 
-function printBdStackPlan(plan: BdStackTask[]) {
-  console.log("TASK\tBRANCH\tBASE");
-  for (const item of plan) {
-    console.log(`${item.task}\t${item.branch}\t${item.baseBranch}`);
+function bdIssueId(issue: Record<string, unknown>): string | undefined {
+  for (const key of ["id", "task", "issue", "name", "ID"]) {
+    const value = issue[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
   }
+  return undefined;
 }
 
-function buildBdStackPrompt(item: BdStackTask): string {
+function buildBdNextPrompt(item: BdNextTask): string {
   return [
     `Implement bd task ${item.task}.`,
     "",
     "You are working in a dedicated git worktree and branch for this task.",
     "",
-    "Stack context:",
+    "Task context:",
     `- Task: ${item.task}`,
     `- Branch: ${item.branch}`,
     `- Base branch: ${item.baseBranch}`,
@@ -883,29 +866,6 @@ function buildBdStackPrompt(item: BdStackTask): string {
     `  - \`bd update ${item.task} --set-metadata cola.pr_url=<PR URL> --set-metadata cola.state=pr-opened\``,
     "- Leave human review and merge manual.",
   ].join("\n");
-}
-
-async function waitForBdPrReady(repoPath: string, task: string, timeoutMs: number) {
-  const deadline = timeoutMs === 0 ? undefined : Date.now() + timeoutMs;
-  while (deadline === undefined || Date.now() <= deadline) {
-    const issue = await bdShow(repoPath, task);
-    const metadata = issueMetadata(issue);
-    if (metadata["cola.state"] === "pr-opened" || typeof metadata["cola.pr_url"] === "string") {
-      return;
-    }
-    await delay(2_000);
-  }
-
-  throw new Error(
-    `Timed out waiting for ${task} to reach cola.state=pr-opened or cola.pr_url.`,
-  );
-}
-
-async function bdShow(repoPath: string, task: string): Promise<BdIssue> {
-  const output = await runBd(repoPath, ["show", task, "--json"]);
-  const parsed = JSON.parse(output);
-  if (Array.isArray(parsed)) return asRecord(parsed[0] ?? {}) as BdIssue;
-  return asRecord(parsed) as BdIssue;
 }
 
 async function bdUpdate(repoPath: string, task: string, args: string[]) {
@@ -938,23 +898,6 @@ async function runBd(repoPath: string, args: string[]): Promise<string> {
   return stdout;
 }
 
-function issueMetadata(issue: BdIssue): Record<string, unknown> {
-  if (isRecord(issue.metadata)) return issue.metadata;
-  const found = findMetadata(issue);
-  return isRecord(found) ? found : {};
-}
-
-function findMetadata(value: unknown): unknown {
-  if (!isRecord(value)) return undefined;
-  if (isRecord(value.metadata)) return value.metadata;
-  if (isRecord(value.Metadata)) return value.Metadata;
-  for (const child of Object.values(value)) {
-    const found = findMetadata(child);
-    if (found) return found;
-  }
-  return undefined;
-}
-
 function sanitizeBranchPart(value: string): string {
   const sanitized = value.toLowerCase().replace(/[^a-z0-9._/-]+/g, "-").replace(/^\/+|\/+$/g, "")
     .replace(/\/{2,}/g, "/");
@@ -962,10 +905,6 @@ function sanitizeBranchPart(value: string): string {
     throw new Error(`Cannot derive branch name from task id: ${value}`);
   }
   return sanitized;
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function createSession(rawOptions: RawCreateOptions): Promise<{
