@@ -14,7 +14,7 @@ worktree creation without mounting the raw Codex app-server socket.
 1. Register allowed repositories on the host:
 
    ```sh
-   cola repo register resnet8 /path/to/resnet8 --branch main
+   cola repo register repo /path/to/repo --branch main
    ```
 
 2. Start the host-side server:
@@ -40,7 +40,7 @@ worktree creation without mounting the raw Codex app-server socket.
    ```sh
    export COLA_SERVER_URL=unix:///run/cola/server.sock
    cola repo list
-   cola worktree resnet8 "task"
+   cola worktree repo "task"
    ```
 
 ## Expectations

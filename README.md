@@ -183,7 +183,7 @@ container:
 ```sh
 cola server --listen unix:///run/cola/server.sock
 COLA_SERVER_URL=unix:///run/cola/server.sock cola repo list
-COLA_SERVER_URL=unix:///run/cola/server.sock cola worktree resnet8 "task"
+COLA_SERVER_URL=unix:///run/cola/server.sock cola worktree repo "task"
 ```
 
 The server exposes only repo list and worktree session operations, enforces the registered repo
