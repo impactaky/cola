@@ -16,6 +16,7 @@ Use `cola` to create Codex app-server sessions from a terminal.
 4. Use `cola repo`, `cola alias`, and `cola config` to set reusable defaults.
 5. Use `cola worktree` when you want a new git worktree and a Codex session in it.
 6. Use `cola bd next` when you want the next ready bd task started in a dedicated Codex session.
+7. Use `cola server` when a container should access host repositories through a guarded Cola socket.
 
 ## Expectations
 
@@ -29,6 +30,7 @@ Use `cola` to create Codex app-server sessions from a terminal.
 - [Install cola](install.md)
 - [Create a Codex session](create-session.md)
 - [Use a Codex app-server socket](connect-app-server.md)
+- [Use the Cola server socket](cola-server.md)
 - [Manage repositories and worktrees](worktrees.md)
 - [Start the next ready bd task](bd-next.md)
 - [Manage config values](config.md)

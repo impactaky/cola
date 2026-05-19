@@ -168,6 +168,30 @@ cola create --worktree cola "implement config-backed worktrees"
 cola create --worktree cola --branch main --new-branch config-work "implement config work"
 ```
 
+## Cola Server Socket
+
+Run a guarded host-side Cola server when a container needs repo and worktree access without mounting
+the raw Codex app-server socket:
+
+```sh
+cola server
+```
+
+By default it listens at `unix:///run/user/$UID/cola/server.sock`. To use a socket mounted into a
+container:
+
+```sh
+cola server --listen unix:///run/cola/server.sock
+COLA_SERVER_URL=unix:///run/cola/server.sock cola repo list
+COLA_SERVER_URL=unix:///run/cola/server.sock cola worktree resnet8 "task"
+```
+
+The server exposes only repo list and worktree session operations, enforces the registered repo
+allowlist on the host, and writes JSONL audit records for server-handled requests. If
+`COLA_SERVER_URL` is set or the default server socket exists but is unavailable, `cola` fails
+instead of falling back to local mode. Set `COLA_ALLOW_LOCAL_FALLBACK=1` only when local fallback is
+intentional.
+
 ## bd Ready Workflow
 
 Register the repository once, then let bd choose the next ready task:
