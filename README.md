@@ -177,8 +177,9 @@ the raw Codex app-server socket:
 cola server
 ```
 
-By default it listens at `unix:///run/user/$UID/cola/server.sock`. To use a socket mounted into a
-container:
+By default it listens at `unix://$XDG_RUNTIME_DIR/cola/server.sock`, or
+`unix:///run/user/$UID/cola/server.sock` when `XDG_RUNTIME_DIR` is unset. To use a socket mounted
+into a container:
 
 ```sh
 cola server --listen unix:///run/cola/server.sock

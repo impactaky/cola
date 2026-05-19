@@ -1714,8 +1714,8 @@ async function colaServerUrlForClient(): Promise<string | undefined> {
   const explicit = Deno.env.get(COLA_SERVER_ENV)?.trim();
   if (explicit) return await validatedColaServerUrl(explicit, true);
 
-  const defaultSocketPath = tryDefaultColaServerSocketPath();
-  if (!defaultSocketPath || !await exists(defaultSocketPath)) return undefined;
+  const defaultSocketPath = await discoverDefaultColaServerSocketPath();
+  if (!defaultSocketPath) return undefined;
   const defaultUrl = `unix://${defaultSocketPath}`;
   return await validatedColaServerUrl(defaultUrl, false);
 }
@@ -1761,6 +1761,29 @@ function tryDefaultColaServerSocketPath(): string | undefined {
   }
 }
 
+async function discoverDefaultColaServerSocketPath(): Promise<string | undefined> {
+  const configured = tryDefaultColaServerSocketPath();
+  if (configured && await exists(configured)) return configured;
+
+  const candidates: string[] = [];
+  try {
+    for await (const entry of Deno.readDir("/run/user")) {
+      if (!entry.isDirectory || !/^\d+$/.test(entry.name)) continue;
+      const path = `/run/user/${entry.name}/cola/server.sock`;
+      if (await exists(path)) candidates.push(path);
+    }
+  } catch {
+    return undefined;
+  }
+
+  candidates.sort();
+  if (candidates.length === 0) return undefined;
+  if (candidates.length === 1) return candidates[0];
+  throw new Error(
+    `Multiple default cola server sockets found: ${candidates.join(", ")}. Set ${COLA_SERVER_ENV}.`,
+  );
+}
+
 function defaultColaServerAuditLogPath(): string {
   return `${configDir()}/server-audit.jsonl`;
 }
@@ -1769,14 +1792,9 @@ function currentUid(): string {
   const envUid = Deno.env.get("UID") ?? Deno.env.get("SUDO_UID");
   if (envUid && /^\d+$/.test(envUid)) return envUid;
 
-  try {
-    return String(Deno.uid());
-  } catch {
-    // Deno.uid requires --allow-sys. Most supported shells provide XDG_RUNTIME_DIR
-    // for the default path before we need this fallback.
-  }
-
-  throw new Error("Cannot determine UID for the default cola server socket.");
+  throw new Error(
+    "Cannot determine UID for the default cola server socket. Set UID or pass --listen.",
+  );
 }
 
 function codexHome(): string {

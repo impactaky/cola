@@ -32,6 +32,27 @@ Deno.test("configured unavailable cola server fails unless local fallback is exp
   assertEquals(fallback.stdout, "resnet8\t/repos/resnet8\tmain\n");
 });
 
+Deno.test("repo list discovers server from XDG_RUNTIME_DIR by default", async () => {
+  const fixture = await makeFixture({ resnet8: { path: "/repos/resnet8", branch: "main" } });
+  const runtimeDir = `${fixture.tempDir}/runtime`;
+  fixture.serverUrl = `unix://${runtimeDir}/cola/server.sock`;
+  const server = await startServer(fixture);
+  try {
+    const result = await runCola(["repo", "list"], fixture, {
+      COLA_SERVER_URL: "",
+      XDG_RUNTIME_DIR: runtimeDir,
+    });
+    assertEquals(result.code, 0, result.stderr);
+    assertEquals(result.stdout, "resnet8\t/repos/resnet8\tmain\n");
+
+    const audit = await readAudit(fixture.auditLog);
+    assertEquals(audit.method, "repo/list");
+    assertEquals(audit.ok, true);
+  } finally {
+    await stopServer(server);
+  }
+});
+
 Deno.test("unavailable default cola server socket fails instead of local fallback", async () => {
   const fixture = await makeFixture({ resnet8: { path: "/repos/resnet8", branch: "main" } });
   await Deno.mkdir(`${fixture.tempDir}/runtime/cola`, { recursive: true });

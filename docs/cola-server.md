@@ -23,11 +23,13 @@ worktree creation without mounting the raw Codex app-server socket.
    cola server
    ```
 
-   By default, the server listens at:
+   By default, the server listens under `XDG_RUNTIME_DIR`:
 
    ```sh
-   unix:///run/user/$UID/cola/server.sock
+   unix://$XDG_RUNTIME_DIR/cola/server.sock
    ```
+
+   If `XDG_RUNTIME_DIR` is unset, the fallback is `unix:///run/user/$UID/cola/server.sock`.
 
 3. Or choose a socket path that is convenient to mount into a container:
 
