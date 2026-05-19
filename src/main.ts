@@ -90,6 +90,31 @@ type BdWaitPrOptions = {
   pollIntervalSeconds: number;
 };
 
+type ColaServerRequest = {
+  id?: JsonRpcId;
+  method: string;
+  params?: Record<string, unknown>;
+};
+
+type ColaServerResponse = {
+  id?: JsonRpcId;
+  result?: unknown;
+  error?: {
+    message: string;
+  };
+};
+
+type RepoListEntry = {
+  name: string;
+  path: string;
+  branch: string;
+};
+
+type ServerOptions = {
+  listen: string;
+  auditLog: string;
+};
+
 type BdIssue = {
   id?: string;
   title?: string;
@@ -101,6 +126,8 @@ const DEFAULT_CODEX_COMMAND = "codex";
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_BD_WAIT_PR_TIMEOUT_SECONDS = 30 * 60;
 const DEFAULT_BD_WAIT_PR_POLL_INTERVAL_SECONDS = 10;
+const COLA_SERVER_ENV = "COLA_SERVER_URL";
+const COLA_ALLOW_LOCAL_FALLBACK_ENV = "COLA_ALLOW_LOCAL_FALLBACK";
 
 const CLIENT_INFO = {
   name: "cola",
@@ -524,6 +551,40 @@ class UnixWebSocket {
   }
 }
 
+class ColaServerClient {
+  #url: string;
+  #encoder = new TextEncoder();
+
+  constructor(url: string) {
+    if (colaServerTransportForUrl(url) !== "unix") {
+      throw new Error(`${COLA_SERVER_ENV} must be a unix:// URL.`);
+    }
+    this.#url = url;
+  }
+
+  async request(method: string, params: Record<string, unknown>): Promise<unknown> {
+    const conn = await Deno.connect({ transport: "unix", path: colaServerSocketPath(this.#url) });
+    try {
+      await writeAll(conn, this.#encoder.encode(`${JSON.stringify({ id: 1, method, params })}\n`));
+      const response = asRecord(JSON.parse(await readLine(conn, 15_000)));
+      if (isRecord(response.error)) {
+        throw new Error(asString(response.error.message) ?? "cola server request failed");
+      }
+      return response.result;
+    } finally {
+      try {
+        conn.close();
+      } catch {
+        // Connection may already be closed.
+      }
+    }
+  }
+
+  get url(): string {
+    return this.#url;
+  }
+}
+
 const approvalPolicyType = new EnumType(["untrusted", "on-request", "on-failure", "never"]);
 const sandboxType = new EnumType(["readOnly", "workspaceWrite", "dangerFullAccess"]);
 const personalityType = new EnumType(["friendly", "pragmatic", "none"]);
@@ -558,6 +619,20 @@ const worktreeCommand = addSessionOptions(new Command(), { branch: true, newBran
       string,
       ...string[],
     ];
+    const serverUrl = await colaServerUrlForClient();
+    if (serverUrl) {
+      await runAction(async () => {
+        const client = new ColaServerClient(serverUrl);
+        const result = await client.request("worktree/create-session", {
+          rawOptions,
+          repoOrAlias,
+          descriptionParts,
+        });
+        printCreateResult(asCreateSessionResult(result));
+      });
+      return;
+    }
+
     const worktreeArgs = await resolveWorktreeArgs(repoOrAlias, descriptionParts);
     await runCreateCommand({
       ...rawOptions,
@@ -581,10 +656,15 @@ const repoCommand = new Command()
   .command("list", "List registered repositories.")
   .action(async () => {
     await runAction(async () => {
-      const repos = (await readConfig()).repos ?? {};
-      for (const [name, repo] of Object.entries(repos)) {
-        console.log(`${name}\t${repo.path}\t${repo.branch ?? "main"}`);
+      const serverUrl = await colaServerUrlForClient();
+      if (serverUrl) {
+        const client = new ColaServerClient(serverUrl);
+        const result = await client.request("repo/list", {});
+        printRepoList(asRepoListEntries(result));
+        return;
       }
+
+      printRepoList(await listRepos());
     });
   })
   .command("remove <name:string>", "Remove a registered repository.")
@@ -595,6 +675,24 @@ const repoCommand = new Command()
       delete config.repos[name];
       await writeConfig(config);
       console.log(`Removed repo ${name}`);
+    });
+  });
+
+const serverCommand = new Command()
+  .description("Run the host-side cola server for guarded container access.")
+  .option(
+    "--listen <url:string>",
+    "Unix socket URL to listen on. Defaults to unix:///run/user/$UID/cola/server.sock.",
+  )
+  .option("--audit-log <path:string>", "JSONL audit log path.", {
+    default: defaultColaServerAuditLogPath(),
+  })
+  .action(async (rawOptions: RawCreateOptions) => {
+    await runAction(async () => {
+      await runColaServer({
+        listen: asString(rawOptions.listen) ?? defaultColaServerUrl(),
+        auditLog: asString(rawOptions.auditLog) ?? defaultColaServerAuditLogPath(),
+      });
     });
   });
 
@@ -722,6 +820,8 @@ await new Command()
   .reset()
   .command("repo", repoCommand)
   .reset()
+  .command("server", serverCommand)
+  .reset()
   .command("config", configCommand)
   .reset()
   .command("alias", aliasCommand)
@@ -791,6 +891,132 @@ async function runAction(action: () => Promise<void>) {
     printError(error);
     Deno.exit(1);
   }
+}
+
+async function runColaServer(options: ServerOptions): Promise<void> {
+  if (colaServerTransportForUrl(options.listen) !== "unix") {
+    throw new Error("--listen must be a unix:// URL.");
+  }
+
+  const socketPath = colaServerSocketPath(options.listen);
+  await prepareColaServerSocket(socketPath);
+  await Deno.mkdir(dirname(options.auditLog), { recursive: true });
+  const listener = Deno.listen({ transport: "unix", path: socketPath });
+  console.log(`cola server listening on ${options.listen}`);
+
+  for await (const conn of listener) {
+    void handleColaServerConnection(conn, options.auditLog);
+  }
+}
+
+async function prepareColaServerSocket(socketPath: string) {
+  await Deno.mkdir(dirname(socketPath), { recursive: true });
+  if (!await exists(socketPath)) return;
+
+  const existing = await Deno.connect({ transport: "unix", path: socketPath }).catch(() =>
+    undefined
+  );
+  if (existing) {
+    existing.close();
+    throw new Error(`cola server socket is already in use: ${socketPath}`);
+  }
+  await Deno.remove(socketPath);
+}
+
+async function handleColaServerConnection(conn: Deno.Conn, auditLog: string) {
+  let request: ColaServerRequest | undefined;
+  const startedAt = new Date().toISOString();
+  try {
+    request = parseColaServerRequest(await readLine(conn, 15_000));
+    const result = await handleColaServerRequest(request);
+    await writeColaServerResponse(conn, { id: request.id, result });
+    await appendAuditLog(auditLog, {
+      ts: startedAt,
+      method: request.method,
+      ok: true,
+      params: auditParams(request.params),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await writeColaServerResponse(conn, { id: request?.id, error: { message } }).catch(() =>
+      undefined
+    );
+    if (request) {
+      await appendAuditLog(auditLog, {
+        ts: startedAt,
+        method: request.method,
+        ok: false,
+        error: message,
+        params: auditParams(request.params),
+      }).catch(() => undefined);
+    }
+  } finally {
+    try {
+      conn.close();
+    } catch {
+      // Connection may already be closed.
+    }
+  }
+}
+
+async function handleColaServerRequest(request: ColaServerRequest): Promise<unknown> {
+  switch (request.method) {
+    case "repo/list":
+      return await listRepos();
+    case "worktree/create-session":
+      return await serverCreateWorktreeSession(asRecord(request.params ?? {}));
+    default:
+      throw new Error(`Unsupported cola server method: ${request.method}`);
+  }
+}
+
+async function serverCreateWorktreeSession(params: Record<string, unknown>) {
+  const rawOptions = asRecord(params.rawOptions ?? {});
+  const repoOrAlias = asNonEmptyString(params.repoOrAlias);
+  if (!repoOrAlias) throw new Error("worktree/create-session requires repoOrAlias.");
+  const descriptionParts = asStringArray(params.descriptionParts ?? []);
+
+  const worktreeArgs = await resolveWorktreeArgs(repoOrAlias, descriptionParts);
+  await assertServerRepoAllowed(worktreeArgs.repo);
+  return await createSession({
+    ...rawOptions,
+    worktree: worktreeArgs.repo,
+    message: worktreeArgs.message,
+    cwd: Deno.cwd(),
+  });
+}
+
+async function assertServerRepoAllowed(repoName: string) {
+  const config = await readConfig();
+  if (config.repos?.[repoName]) return;
+  throw new Error(`Repo ${repoName} is not allowed by the cola server repo allowlist.`);
+}
+
+function parseColaServerRequest(line: string): ColaServerRequest {
+  const value = asRecord(JSON.parse(line));
+  const method = asNonEmptyString(value.method);
+  if (!method) throw new Error("cola server request missing method.");
+  return {
+    id: typeof value.id === "number" || typeof value.id === "string" ? value.id : undefined,
+    method,
+    params: isRecord(value.params) ? value.params : undefined,
+  };
+}
+
+async function writeColaServerResponse(conn: Deno.Conn, response: ColaServerResponse) {
+  await writeAll(conn, new TextEncoder().encode(`${JSON.stringify(response)}\n`));
+}
+
+async function appendAuditLog(path: string, event: Record<string, unknown>) {
+  await Deno.writeTextFile(path, `${JSON.stringify(event)}\n`, { append: true, create: true });
+}
+
+function auditParams(params: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (!params) return {};
+  return {
+    repoOrAlias: params.repoOrAlias,
+    descriptionParts: params.descriptionParts,
+  };
 }
 
 async function runBdNextCommand(
@@ -1241,6 +1467,38 @@ function asNumber(value: unknown): number | undefined {
   return typeof value === "number" ? value : undefined;
 }
 
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error(`Expected string array, got ${stringify(value)}`);
+  }
+  return value;
+}
+
+function asRepoListEntries(value: unknown): RepoListEntry[] {
+  if (!Array.isArray(value)) throw new Error(`Expected repo list, got ${stringify(value)}`);
+  return value.map((item) => {
+    const repo = asRecord(item);
+    const name = asNonEmptyString(repo.name);
+    const path = asNonEmptyString(repo.path);
+    const branch = asNonEmptyString(repo.branch);
+    if (!name || !path || !branch) throw new Error(`Invalid repo entry: ${stringify(item)}`);
+    return { name, path, branch };
+  });
+}
+
+function asCreateSessionResult(value: unknown): {
+  thread: ThreadSummary;
+  turn?: TurnSummary;
+  options: CreateOptions;
+} {
+  const result = asRecord(value);
+  return {
+    thread: asRecord(result.thread) as ThreadSummary,
+    turn: result.turn === undefined ? undefined : asRecord(result.turn) as TurnSummary,
+    options: asRecord(result.options) as CreateOptions,
+  };
+}
+
 async function promptMessageInEditor(): Promise<string> {
   const path = await Deno.makeTempFile({ prefix: "cola-message-", suffix: ".md" });
   try {
@@ -1366,6 +1624,21 @@ async function resolveRepo(name: string): Promise<RepoConfig> {
   );
 }
 
+async function listRepos(): Promise<RepoListEntry[]> {
+  const repos = (await readConfig()).repos ?? {};
+  return Object.entries(repos).map(([name, repo]) => ({
+    name,
+    path: repo.path,
+    branch: repo.branch ?? "main",
+  }));
+}
+
+function printRepoList(repos: RepoListEntry[]) {
+  for (const repo of repos) {
+    console.log(`${repo.name}\t${repo.path}\t${repo.branch}`);
+  }
+}
+
 async function upsertRepo(name: string, repo: RepoConfig) {
   validateConfigName(name, "Repo");
   const config = await readConfig();
@@ -1437,6 +1710,93 @@ function configDir(): string {
   throw new Error("Cannot determine XDG config directory: HOME is not set.");
 }
 
+async function colaServerUrlForClient(): Promise<string | undefined> {
+  const explicit = Deno.env.get(COLA_SERVER_ENV)?.trim();
+  if (explicit) return await validatedColaServerUrl(explicit, true);
+
+  const defaultSocketPath = await discoverDefaultColaServerSocketPath();
+  if (!defaultSocketPath) return undefined;
+  const defaultUrl = `unix://${defaultSocketPath}`;
+  return await validatedColaServerUrl(defaultUrl, false);
+}
+
+async function validatedColaServerUrl(url: string, explicit: boolean): Promise<string | undefined> {
+  if (colaServerTransportForUrl(url) !== "unix") {
+    throw new Error(`${COLA_SERVER_ENV} must be a unix:// URL.`);
+  }
+
+  if (await canConnectColaServer(url)) return url;
+  if (Deno.env.get(COLA_ALLOW_LOCAL_FALLBACK_ENV) === "1") return undefined;
+
+  const source = explicit ? COLA_SERVER_ENV : "default cola server socket";
+  throw new Error(
+    `${source} is configured but unavailable: ${url}. Set ${COLA_ALLOW_LOCAL_FALLBACK_ENV}=1 to use local mode.`,
+  );
+}
+
+async function canConnectColaServer(url: string): Promise<boolean> {
+  const conn = await Deno.connect({ transport: "unix", path: colaServerSocketPath(url) }).catch(
+    () => undefined,
+  );
+  if (!conn) return false;
+  conn.close();
+  return true;
+}
+
+function defaultColaServerUrl(): string {
+  return `unix://${defaultColaServerSocketPath()}`;
+}
+
+function defaultColaServerSocketPath(): string {
+  const runtimeDir = Deno.env.get("XDG_RUNTIME_DIR");
+  if (runtimeDir) return `${runtimeDir}/cola/server.sock`;
+  return `/run/user/${currentUid()}/cola/server.sock`;
+}
+
+function tryDefaultColaServerSocketPath(): string | undefined {
+  try {
+    return defaultColaServerSocketPath();
+  } catch {
+    return undefined;
+  }
+}
+
+async function discoverDefaultColaServerSocketPath(): Promise<string | undefined> {
+  const configured = tryDefaultColaServerSocketPath();
+  if (configured && await exists(configured)) return configured;
+
+  const candidates: string[] = [];
+  try {
+    for await (const entry of Deno.readDir("/run/user")) {
+      if (!entry.isDirectory || !/^\d+$/.test(entry.name)) continue;
+      const path = `/run/user/${entry.name}/cola/server.sock`;
+      if (await exists(path)) candidates.push(path);
+    }
+  } catch {
+    return undefined;
+  }
+
+  candidates.sort();
+  if (candidates.length === 0) return undefined;
+  if (candidates.length === 1) return candidates[0];
+  throw new Error(
+    `Multiple default cola server sockets found: ${candidates.join(", ")}. Set ${COLA_SERVER_ENV}.`,
+  );
+}
+
+function defaultColaServerAuditLogPath(): string {
+  return `${configDir()}/server-audit.jsonl`;
+}
+
+function currentUid(): string {
+  const envUid = Deno.env.get("UID") ?? Deno.env.get("SUDO_UID");
+  if (envUid && /^\d+$/.test(envUid)) return envUid;
+
+  throw new Error(
+    "Cannot determine UID for the default cola server socket. Set UID or pass --listen.",
+  );
+}
+
 function codexHome(): string {
   const home = Deno.env.get("CODEX_HOME");
   if (home) return home;
@@ -1505,10 +1865,32 @@ function basename(path: string): string {
   return index >= 0 ? trimmed.slice(index + 1) : trimmed;
 }
 
+function dirname(path: string): string {
+  const trimmed = path.replace(/\/+$/g, "") || "/";
+  const index = trimmed.lastIndexOf("/");
+  if (index <= 0) return "/";
+  return trimmed.slice(0, index);
+}
+
 function transportForUrl(url: string): AppServerTransport | undefined {
   if (url.startsWith("ws://")) return "websocket";
   if (url.startsWith("unix://")) return "unix";
   return undefined;
+}
+
+function colaServerTransportForUrl(url: string): "unix" | undefined {
+  return url.startsWith("unix://") ? "unix" : undefined;
+}
+
+function colaServerSocketPath(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "unix:") throw new Error();
+    if (!parsed.pathname) throw new Error();
+    return decodeURIComponent(parsed.pathname);
+  } catch {
+    throw new Error(`Invalid cola server unix:// URL: ${url}`);
+  }
 }
 
 function unixSocketPath(url: string): string {
@@ -1576,6 +1958,28 @@ async function readHttpHeader(
   }
 
   throw new Error("Failed to read WebSocket handshake");
+}
+
+async function readLine(conn: Deno.Conn, timeoutMs: number): Promise<string> {
+  let buffer = "";
+  const decoder = new TextDecoder();
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const newline = buffer.indexOf("\n");
+    if (newline >= 0) return buffer.slice(0, newline).trim();
+
+    const chunk = new Uint8Array(4096);
+    const read = await withTimeout(
+      conn.read(chunk),
+      Math.max(1, deadline - Date.now()),
+      "Timed out waiting for cola server response",
+    );
+    if (read === null) break;
+    buffer += decoder.decode(chunk.slice(0, read), { stream: true });
+  }
+
+  throw new Error("Failed to read cola server response");
 }
 
 async function validateWebSocketHandshake(header: string, key: string, url: string) {
