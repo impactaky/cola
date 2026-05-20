@@ -1,5 +1,45 @@
 const decoder = new TextDecoder();
 
+Deno.test("create validates model instructions file", async () => {
+  const fixture = await makeFixture({});
+  const missingPath = `${fixture.tempDir}/missing.md`;
+
+  const missing = await runCola(
+    [
+      "create",
+      "--model-instructions-file",
+      missingPath,
+      "run tests",
+    ],
+    fixture,
+    {
+      COLA_SERVER_URL: "",
+    },
+  );
+  assertEquals(missing.code, 1);
+  assertIncludes(missing.stderr, `--model-instructions-file does not exist: ${missingPath}`);
+
+  const directoryPath = `${fixture.tempDir}/instructions-dir`;
+  await Deno.mkdir(directoryPath);
+  const directory = await runCola(
+    [
+      "create",
+      "--model-instructions-file",
+      directoryPath,
+      "run tests",
+    ],
+    fixture,
+    {
+      COLA_SERVER_URL: "",
+    },
+  );
+  assertEquals(directory.code, 1);
+  assertIncludes(
+    directory.stderr,
+    `--model-instructions-file must be a regular file: ${directoryPath}`,
+  );
+});
+
 Deno.test("repo list uses cola server and writes audit JSONL", async () => {
   const fixture = await makeFixture({ resnet8: { path: "/repos/resnet8", branch: "main" } });
   const server = await startServer(fixture);
@@ -121,7 +161,10 @@ async function makeFixture(
   };
 }
 
-async function startServer(fixture: Fixture): Promise<Deno.ChildProcess> {
+async function startServer(
+  fixture: Fixture,
+  extraEnv: Record<string, string> = {},
+): Promise<Deno.ChildProcess> {
   const command = new Deno.Command("deno", {
     args: [
       "run",
@@ -133,7 +176,7 @@ async function startServer(fixture: Fixture): Promise<Deno.ChildProcess> {
       "--audit-log",
       fixture.auditLog,
     ],
-    env: commandEnv(fixture),
+    env: commandEnv(fixture, extraEnv),
     stdin: "null",
     stdout: "null",
     stderr: "null",

@@ -46,6 +46,7 @@ type CreateOptions = {
   approvalPolicy?: string;
   sandbox?: string;
   personality?: string;
+  modelInstructionsFile?: string;
   message?: string;
   timeoutMs: number;
   json: boolean;
@@ -769,6 +770,10 @@ const bdCommand = new Command()
     default: DEFAULT_CODEX_COMMAND,
   })
   .option("--model <model:string>", "Model override for the new sessions.")
+  .option(
+    "--model-instructions-file <path:string>",
+    "Path to model instructions for the new session.",
+  )
   .option("--approval-policy <policy:approval-policy>", "Approval policy override.")
   .option("--sandbox <mode:sandbox>", "Sandbox mode override.")
   .option("--personality <personality:personality>", "Codex personality override.")
@@ -841,6 +846,10 @@ function addSessionOptions(
       default: DEFAULT_CODEX_COMMAND,
     })
     .option("--model <model:string>", "Model override for the new session.")
+    .option(
+      "--model-instructions-file <path:string>",
+      "Path to model instructions for the new session.",
+    )
     .option("--approval-policy <policy:approval-policy>", "Approval policy override.")
     .option("--sandbox <mode:sandbox>", "Sandbox mode override.")
     .option("--personality <personality:personality>", "Codex personality override.")
@@ -1355,6 +1364,7 @@ async function createOptions(rawOptions: RawCreateOptions): Promise<CreateOption
     approvalPolicy: asString(rawOptions.approvalPolicy),
     sandbox: asString(rawOptions.sandbox),
     personality: asString(rawOptions.personality),
+    modelInstructionsFile: asString(rawOptions.modelInstructionsFile),
     message: asString(rawOptions.message),
     timeoutMs: asNumber(rawOptions.timeoutMs) ?? DEFAULT_TIMEOUT_MS,
     json: rawOptions.json === true,
@@ -1390,6 +1400,17 @@ async function validateOptions(options: CreateOptions) {
   if (options.connect && !transportForUrl(options.connect)) {
     throw new Error("--connect must be a ws:// or unix:// URL.");
   }
+  if (options.modelInstructionsFile) {
+    const stat = await Deno.stat(options.modelInstructionsFile).catch(() => undefined);
+    if (!stat) {
+      throw new Error(`--model-instructions-file does not exist: ${options.modelInstructionsFile}`);
+    }
+    if (!stat.isFile) {
+      throw new Error(
+        `--model-instructions-file must be a regular file: ${options.modelInstructionsFile}`,
+      );
+    }
+  }
 
   const cwd = await Deno.stat(options.cwd).catch(() => undefined);
   if (!cwd) throw new Error(`--cwd does not exist: ${options.cwd}`);
@@ -1403,6 +1424,11 @@ function sessionParams(options: CreateOptions): Record<string, unknown> {
   if (options.approvalPolicy) params.approvalPolicy = options.approvalPolicy;
   if (options.sandbox) params.sandbox = options.sandbox;
   if (options.personality) params.personality = options.personality;
+  if (options.modelInstructionsFile) {
+    params.config = {
+      model_instructions_file: options.modelInstructionsFile,
+    };
+  }
   return params;
 }
 
