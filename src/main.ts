@@ -61,6 +61,7 @@ type RawCreateOptions = Record<string, unknown>;
 type Config = {
   repos?: Record<string, RepoConfig>;
   aliases?: Record<string, string>;
+  controlPlaneDb?: string;
 };
 
 type RepoConfig = {
@@ -83,7 +84,7 @@ type BdNextTask = {
 
 type BdNextResult = {
   task: string;
-  repoPath: string;
+  controlPlaneDb: string;
 };
 
 type BdWaitPrOptions = {
@@ -791,7 +792,7 @@ const bdCommand = new Command()
     await runAction(async () => {
       const result = await runBdNextCommand(repo, rawOptions);
       if (rawOptions.waitPr === true && result) {
-        await runBdWaitPr(result.task, rawOptions, result.repoPath);
+        await runBdWaitPr(result.task, rawOptions, result.controlPlaneDb);
       }
     });
   })
@@ -1032,8 +1033,16 @@ async function runBdNextCommand(
   repoName: string,
   rawOptions: RawCreateOptions,
 ): Promise<BdNextResult | undefined> {
+  const config = await readConfig();
+  const controlPlaneDb = config.controlPlaneDb;
+  if (!controlPlaneDb) {
+    throw new Error(
+      "cola bd next requires config 'controlPlaneDb'. Set it with: cola config set controlPlaneDb <path>",
+    );
+  }
+
   const repo = await resolveRepo(repoName);
-  const issue = await bdReadyOne(repo.path);
+  const issue = await bdReadyOne(controlPlaneDb, repoName);
   if (!issue) {
     console.log("No ready bd tasks found.");
     return undefined;
@@ -1049,9 +1058,7 @@ async function runBdNextCommand(
     baseBranch: asString(rawOptions.base) ?? repo.branch ?? "main",
   };
 
-  await bdUpdate(repo.path, item.task, ["--claim"]);
-
-  const message = buildBdNextPrompt(item);
+  const message = buildBdNextPrompt(item, controlPlaneDb);
   const { thread, turn, options } = await createSession({
     ...rawOptions,
     json: false,
@@ -1070,7 +1077,7 @@ async function runBdNextCommand(
   if (!worktreePath) throw new Error(`Worktree was not created for ${item.task}.`);
   const baseBranch = options.worktreeInfo?.baseBranch ?? item.baseBranch;
 
-  await bdUpdateMetadata(repo.path, item.task, {
+  await bdUpdateMetadata(controlPlaneDb, item.task, {
     "cola.session_id": sessionId,
     "cola.turn_id": turnId,
     "cola.worktree": worktreePath,
@@ -1085,16 +1092,16 @@ async function runBdNextCommand(
   console.log(`  worktree: ${worktreePath}`);
   console.log(`  branch: ${item.branch}`);
   console.log(`  base: ${baseBranch}`);
-  return { task: item.task, repoPath: repo.path };
+  return { task: item.task, controlPlaneDb };
 }
 
 async function runBdWaitPr(
   task: string,
   rawOptions: RawCreateOptions,
-  repoPath: string,
+  controlPlaneDb: string,
 ) {
   const options = bdWaitPrOptions(rawOptions);
-  const result = await waitForBdPr(repoPath, task, options);
+  const result = await waitForBdPr(controlPlaneDb, task, options);
   console.log(`PR recorded for ${task}: ${result.prUrl ?? "cola.state=pr-opened"}`);
   if (result.prUrl) {
     await verifyPrUrlWithGh(result.prUrl);
@@ -1111,7 +1118,7 @@ function bdWaitPrOptions(rawOptions: RawCreateOptions): BdWaitPrOptions {
 }
 
 async function waitForBdPr(
-  repoPath: string,
+  controlPlaneDb: string,
   task: string,
   options: BdWaitPrOptions,
 ): Promise<{ prUrl?: string }> {
@@ -1119,7 +1126,7 @@ async function waitForBdPr(
   let lastState = "";
 
   while (true) {
-    const issue = await bdShow(repoPath, task);
+    const issue = await bdShow(controlPlaneDb, task);
     const state = bdMetadataString(issue, "cola.state");
     const prUrl = bdMetadataString(issue, "cola.pr_url");
     lastState = state ?? "";
@@ -1143,14 +1150,22 @@ async function waitForBdPr(
   }
 }
 
-async function bdReadyOne(repoPath: string): Promise<BdIssue | undefined> {
-  const output = await runBd(repoPath, ["ready", "--json", "--limit", "1"]);
+async function bdReadyOne(controlPlaneDb: string, repoName: string): Promise<BdIssue | undefined> {
+  const output = await runBd(controlPlaneDb, [
+    "ready",
+    "--label",
+    `repo:${repoName}`,
+    "--claim",
+    "--json",
+    "--limit",
+    "1",
+  ]);
   const parsed = JSON.parse(output);
   return firstBdIssue(parsed);
 }
 
-async function bdShow(repoPath: string, task: string): Promise<Record<string, unknown>> {
-  const output = await runBd(repoPath, ["show", task, "--json"]);
+async function bdShow(controlPlaneDb: string, task: string): Promise<Record<string, unknown>> {
+  const output = await runBd(controlPlaneDb, ["show", task, "--json"]);
   return asRecord(JSON.parse(output));
 }
 
@@ -1177,7 +1192,7 @@ function bdIssueId(issue: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
-function buildBdNextPrompt(item: BdNextTask): string {
+function buildBdNextPrompt(item: BdNextTask, controlPlaneDb: string): string {
   return [
     `Implement bd task ${item.task}.`,
     "",
@@ -1189,7 +1204,7 @@ function buildBdNextPrompt(item: BdNextTask): string {
     `- Base branch: ${item.baseBranch}`,
     "",
     "Instructions:",
-    `- Run \`bd show ${item.task} --long\` first and keep the change scoped to that task.`,
+    `- Run \`bd -C ${controlPlaneDb} show ${item.task} --long\` first and keep the change scoped to that task.`,
     "- Implement the requested change.",
     "- Run the relevant checks for the repository.",
     "- Commit the completed work on this branch.",
@@ -1197,17 +1212,17 @@ function buildBdNextPrompt(item: BdNextTask): string {
     `- Create a PR with base \`${item.baseBranch}\` and head \`${item.branch}\`.`,
     "- Do not merge the PR.",
     "- After opening the PR, update bd metadata with:",
-    `  - \`bd update ${item.task} --set-metadata cola.pr_url=<PR URL> --set-metadata cola.state=pr-opened\``,
+    `  - \`bd -C ${controlPlaneDb} update ${item.task} --set-metadata cola.pr_url=<PR URL> --set-metadata cola.state=pr-opened\``,
     "- Leave human review and merge manual.",
   ].join("\n");
 }
 
-async function bdUpdate(repoPath: string, task: string, args: string[]) {
-  await runBd(repoPath, ["update", task, ...args]);
+async function bdUpdate(controlPlaneDb: string, task: string, args: string[]) {
+  await runBd(controlPlaneDb, ["update", task, ...args]);
 }
 
 async function bdUpdateMetadata(
-  repoPath: string,
+  controlPlaneDb: string,
   task: string,
   metadata: Record<string, string>,
 ) {
@@ -1215,13 +1230,13 @@ async function bdUpdateMetadata(
     "--set-metadata",
     `${key}=${value}`,
   ]);
-  await bdUpdate(repoPath, task, args);
+  await bdUpdate(controlPlaneDb, task, args);
 }
 
-async function runBd(repoPath: string, args: string[]): Promise<string> {
+async function runBd(controlPlaneDb: string, args: string[]): Promise<string> {
   const command = new Deno.Command("bd", {
-    args,
-    cwd: repoPath,
+    args: ["-C", controlPlaneDb, ...args],
+    cwd: controlPlaneDb,
     stdout: "piped",
     stderr: "piped",
   });
