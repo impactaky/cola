@@ -1,4 +1,4 @@
-#!/usr/bin/env -S deno run --allow-run=bd,codex,ps,git,vi,gh --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost
+#!/usr/bin/env -S deno run --allow-run=codex,ps,git,vi --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost
 
 import { Command, EnumType } from "@cliffy/command";
 import { CompletionsCommand } from "@cliffy/command/completions";
@@ -75,22 +75,6 @@ type WorktreeInfo = {
   baseBranch: string;
 };
 
-type BdNextTask = {
-  task: string;
-  branch: string;
-  baseBranch: string;
-};
-
-type BdNextResult = {
-  task: string;
-  repoPath: string;
-};
-
-type BdWaitPrOptions = {
-  timeoutSeconds: number;
-  pollIntervalSeconds: number;
-};
-
 type ColaServerRequest = {
   id?: JsonRpcId;
   method: string;
@@ -116,17 +100,8 @@ type ServerOptions = {
   auditLog: string;
 };
 
-type BdIssue = {
-  id?: string;
-  title?: string;
-  description?: string;
-  metadata?: Record<string, unknown>;
-};
-
 const DEFAULT_CODEX_COMMAND = "codex";
 const DEFAULT_TIMEOUT_MS = 15_000;
-const DEFAULT_BD_WAIT_PR_TIMEOUT_SECONDS = 30 * 60;
-const DEFAULT_BD_WAIT_PR_POLL_INTERVAL_SECONDS = 10;
 const COLA_SERVER_ENV = "COLA_SERVER_URL";
 const COLA_ALLOW_LOCAL_FALLBACK_ENV = "COLA_ALLOW_LOCAL_FALLBACK";
 
@@ -758,58 +733,6 @@ const aliasCommand = new Command()
     });
   });
 
-const bdCommand = new Command()
-  .description("Run bd-backed Cola task automation.")
-  .command("next <repo:string>", "Start one Codex session for the next ready bd task.")
-  .type("approval-policy", approvalPolicyType)
-  .type("sandbox", sandboxType)
-  .type("personality", personalityType)
-  .option("--base <branch:string>", "Base branch for the task worktree.")
-  .option("--connect <url:string>", "Use an existing app-server ws:// or unix:// URL.")
-  .option("--codex-command <command:string>", "Codex executable to run.", {
-    default: DEFAULT_CODEX_COMMAND,
-  })
-  .option("--model <model:string>", "Model override for the new sessions.")
-  .option(
-    "--model-instructions-file <path:string>",
-    "Path to model instructions for the new session.",
-  )
-  .option("--approval-policy <policy:approval-policy>", "Approval policy override.")
-  .option("--sandbox <mode:sandbox>", "Sandbox mode override.")
-  .option("--personality <personality:personality>", "Codex personality override.")
-  .option("--timeout-ms <ms:integer>", "Request timeout in milliseconds.", {
-    default: DEFAULT_TIMEOUT_MS,
-  })
-  .option("--wait-pr", "Wait until the selected task records an open PR.", { default: false })
-  .option("--timeout <seconds:integer>", "Seconds to wait for PR metadata.", {
-    default: DEFAULT_BD_WAIT_PR_TIMEOUT_SECONDS,
-  })
-  .option("--poll-interval <seconds:integer>", "Seconds between bd show polls.", {
-    default: DEFAULT_BD_WAIT_PR_POLL_INTERVAL_SECONDS,
-  })
-  .action(async (rawOptions: RawCreateOptions, repo: string) => {
-    await runAction(async () => {
-      const result = await runBdNextCommand(repo, rawOptions);
-      if (rawOptions.waitPr === true && result) {
-        await runBdWaitPr(result.task, rawOptions, result.repoPath);
-      }
-    });
-  })
-  .reset()
-  .command("wait-pr <task-id:string>", "Wait until a bd task records an opened PR.")
-  .option("--timeout <seconds:integer>", "Seconds to wait for PR metadata.", {
-    default: DEFAULT_BD_WAIT_PR_TIMEOUT_SECONDS,
-  })
-  .option("--poll-interval <seconds:integer>", "Seconds between bd show polls.", {
-    default: DEFAULT_BD_WAIT_PR_POLL_INTERVAL_SECONDS,
-  })
-  .action(async (rawOptions: RawCreateOptions, taskId: string) => {
-    await runAction(async () => {
-      await runBdWaitPr(taskId, rawOptions, Deno.cwd());
-    });
-  })
-  .reset();
-
 await new Command()
   .name("cola")
   .version("0.1.0")
@@ -830,8 +753,6 @@ await new Command()
   .command("config", configCommand)
   .reset()
   .command("alias", aliasCommand)
-  .reset()
-  .command("bd", bdCommand)
   .reset()
   .command("completions", new CompletionsCommand())
   .parse(Deno.args);
@@ -1028,272 +949,8 @@ function auditParams(params: Record<string, unknown> | undefined): Record<string
   };
 }
 
-async function runBdNextCommand(
-  repoName: string,
-  rawOptions: RawCreateOptions,
-): Promise<BdNextResult | undefined> {
-  const repo = await resolveRepo(repoName);
-  const issue = await bdReadyOne(repo.path);
-  if (!issue) {
-    console.log("No ready bd tasks found.");
-    return undefined;
-  }
-
-  const task = bdIssueId(issue);
-  if (!task) {
-    throw new Error(`bd ready --json did not return a task id: ${stringify(issue)}`);
-  }
-  const item: BdNextTask = {
-    task,
-    branch: `bd/${sanitizeBranchPart(task)}`,
-    baseBranch: asString(rawOptions.base) ?? repo.branch ?? "main",
-  };
-
-  await bdUpdate(repo.path, item.task, ["--claim"]);
-
-  const message = buildBdNextPrompt(item);
-  const { thread, turn, options } = await createSession({
-    ...rawOptions,
-    json: false,
-    message,
-    worktree: repoName,
-    branch: item.baseBranch,
-    newBranch: item.branch,
-    cwd: Deno.cwd(),
-  });
-
-  const sessionId = thread.id;
-  if (!sessionId) throw new Error(`Codex did not return a session id for ${item.task}.`);
-  const turnId = turn?.id;
-  if (!turnId) throw new Error(`Codex did not return a turn id for ${item.task}.`);
-  const worktreePath = options.worktreeInfo?.path;
-  if (!worktreePath) throw new Error(`Worktree was not created for ${item.task}.`);
-  const baseBranch = options.worktreeInfo?.baseBranch ?? item.baseBranch;
-
-  await bdUpdateMetadata(repo.path, item.task, {
-    "cola.session_id": sessionId,
-    "cola.turn_id": turnId,
-    "cola.worktree": worktreePath,
-    "cola.branch": item.branch,
-    "cola.base_branch": baseBranch,
-    "cola.state": "session-started",
-  });
-
-  console.log(`Started ${item.task}`);
-  console.log(`  session: ${sessionId}`);
-  console.log(`  turn: ${turnId}`);
-  console.log(`  worktree: ${worktreePath}`);
-  console.log(`  branch: ${item.branch}`);
-  console.log(`  base: ${baseBranch}`);
-  return { task: item.task, repoPath: repo.path };
-}
-
-async function runBdWaitPr(
-  task: string,
-  rawOptions: RawCreateOptions,
-  repoPath: string,
-) {
-  const options = bdWaitPrOptions(rawOptions);
-  const result = await waitForBdPr(repoPath, task, options);
-  console.log(`PR recorded for ${task}: ${result.prUrl ?? "cola.state=pr-opened"}`);
-  if (result.prUrl) {
-    await verifyPrUrlWithGh(result.prUrl);
-  }
-}
-
-function bdWaitPrOptions(rawOptions: RawCreateOptions): BdWaitPrOptions {
-  const timeoutSeconds = asNumber(rawOptions.timeout) ?? DEFAULT_BD_WAIT_PR_TIMEOUT_SECONDS;
-  const pollIntervalSeconds = asNumber(rawOptions.pollInterval) ??
-    DEFAULT_BD_WAIT_PR_POLL_INTERVAL_SECONDS;
-  if (timeoutSeconds <= 0) throw new Error("--timeout must be greater than 0.");
-  if (pollIntervalSeconds <= 0) throw new Error("--poll-interval must be greater than 0.");
-  return { timeoutSeconds, pollIntervalSeconds };
-}
-
-async function waitForBdPr(
-  repoPath: string,
-  task: string,
-  options: BdWaitPrOptions,
-): Promise<{ prUrl?: string }> {
-  const deadline = Date.now() + options.timeoutSeconds * 1000;
-  let lastState = "";
-
-  while (true) {
-    const issue = await bdShow(repoPath, task);
-    const state = bdMetadataString(issue, "cola.state");
-    const prUrl = bdMetadataString(issue, "cola.pr_url");
-    lastState = state ?? "";
-
-    if (state === "failed") {
-      throw new Error(`bd task ${task} recorded cola.state=failed.`);
-    }
-    if (state === "pr-opened" || prUrl) {
-      return { prUrl };
-    }
-
-    const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) {
-      const suffix = lastState ? ` Last cola.state=${lastState}.` : "";
-      throw new Error(
-        `Timed out waiting ${options.timeoutSeconds}s for ${task} to record cola.state=pr-opened or cola.pr_url.${suffix}`,
-      );
-    }
-
-    await sleep(Math.min(options.pollIntervalSeconds * 1000, remainingMs));
-  }
-}
-
-async function bdReadyOne(repoPath: string): Promise<BdIssue | undefined> {
-  const output = await runBd(repoPath, ["ready", "--json", "--limit", "1"]);
-  const parsed = JSON.parse(output);
-  return firstBdIssue(parsed);
-}
-
-async function bdShow(repoPath: string, task: string): Promise<Record<string, unknown>> {
-  const output = await runBd(repoPath, ["show", task, "--json"]);
-  return asRecord(JSON.parse(output));
-}
-
-function firstBdIssue(value: unknown): BdIssue | undefined {
-  if (Array.isArray(value)) {
-    const first = value.find((item) => isRecord(item) && bdIssueId(item));
-    return first ? first as BdIssue : undefined;
-  }
-  if (!isRecord(value)) return undefined;
-  if (bdIssueId(value)) return value as BdIssue;
-
-  for (const key of ["issues", "items", "tasks", "ready", "results"]) {
-    const nested = firstBdIssue(value[key]);
-    if (nested) return nested;
-  }
-  return undefined;
-}
-
-function bdIssueId(issue: Record<string, unknown>): string | undefined {
-  for (const key of ["id", "task", "issue", "name", "ID"]) {
-    const value = issue[key];
-    if (typeof value === "string" && value.trim()) return value.trim();
-  }
-  return undefined;
-}
-
-function buildBdNextPrompt(item: BdNextTask): string {
-  return [
-    `Implement bd task ${item.task}.`,
-    "",
-    "You are working in a dedicated git worktree and branch for this task.",
-    "",
-    "Task context:",
-    `- Task: ${item.task}`,
-    `- Branch: ${item.branch}`,
-    `- Base branch: ${item.baseBranch}`,
-    "",
-    "Instructions:",
-    `- Run \`bd show ${item.task} --long\` first and keep the change scoped to that task.`,
-    "- Implement the requested change.",
-    "- Run the relevant checks for the repository.",
-    "- Commit the completed work on this branch.",
-    "- Push the branch.",
-    `- Create a PR with base \`${item.baseBranch}\` and head \`${item.branch}\`.`,
-    "- Do not merge the PR.",
-    "- After opening the PR, update bd metadata with:",
-    `  - \`bd update ${item.task} --set-metadata cola.pr_url=<PR URL> --set-metadata cola.state=pr-opened\``,
-    "- Leave human review and merge manual.",
-  ].join("\n");
-}
-
-async function bdUpdate(repoPath: string, task: string, args: string[]) {
-  await runBd(repoPath, ["update", task, ...args]);
-}
-
-async function bdUpdateMetadata(
-  repoPath: string,
-  task: string,
-  metadata: Record<string, string>,
-) {
-  const args = Object.entries(metadata).flatMap(([key, value]) => [
-    "--set-metadata",
-    `${key}=${value}`,
-  ]);
-  await bdUpdate(repoPath, task, args);
-}
-
-async function runBd(repoPath: string, args: string[]): Promise<string> {
-  const command = new Deno.Command("bd", {
-    args,
-    cwd: repoPath,
-    stdout: "piped",
-    stderr: "piped",
-  });
-  const output = await command.output();
-  const stdout = new TextDecoder().decode(output.stdout);
-  const stderr = new TextDecoder().decode(output.stderr).trim();
-  if (!output.success) throw new Error(stderr || `bd ${args.join(" ")} failed`);
-  return stdout;
-}
-
-function bdMetadataString(issue: Record<string, unknown>, key: string): string | undefined {
-  const direct = asNonEmptyString(issue[key]);
-  if (direct) return direct;
-
-  const metadata = issue.metadata;
-  if (isRecord(metadata)) {
-    const metadataDirect = asNonEmptyString(metadata[key]);
-    if (metadataDirect) return metadataDirect;
-  }
-
-  const dotted = key.split(".");
-  return asNonEmptyString(readPath(issue, dotted)) ??
-    (isRecord(metadata) ? asNonEmptyString(readPath(metadata, dotted)) : undefined);
-}
-
-function readPath(value: unknown, path: string[]): unknown {
-  let current = value;
-  for (const part of path) {
-    if (!isRecord(current)) return undefined;
-    current = current[part];
-  }
-  return current;
-}
-
 function asNonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-async function verifyPrUrlWithGh(prUrl: string) {
-  let output: Deno.CommandOutput;
-  try {
-    const command = new Deno.Command("gh", {
-      args: ["pr", "view", prUrl, "--json", "url,state"],
-      stdout: "piped",
-      stderr: "piped",
-    });
-    output = await command.output();
-  } catch (error) {
-    if (error instanceof Deno.errors.NotFound) return;
-    throw error;
-  }
-
-  if (output.success) {
-    console.log(`Verified PR with gh: ${prUrl}`);
-    return;
-  }
-
-  const stderr = new TextDecoder().decode(output.stderr).trim();
-  console.error(`Warning: gh pr view could not verify ${prUrl}${stderr ? `: ${stderr}` : "."}`);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function sanitizeBranchPart(value: string): string {
-  const sanitized = value.toLowerCase().replace(/[^a-z0-9._/-]+/g, "-").replace(/^\/+|\/+$/g, "")
-    .replace(/\/{2,}/g, "/");
-  if (!sanitized || sanitized === "." || sanitized === "..") {
-    throw new Error(`Cannot derive branch name from task id: ${value}`);
-  }
-  return sanitized;
 }
 
 async function createSession(rawOptions: RawCreateOptions): Promise<{

@@ -14,7 +14,7 @@ Install the `cola` command with Deno.
 1. Run:
 
    ```sh
-   deno install --global --config deno.json --allow-run=bd,codex,ps,git,"$EDITOR" --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost --name cola ./src/main.ts
+   deno install --global --config deno.json --allow-run=codex,ps,git,"$EDITOR" --allow-read --allow-write --allow-env --allow-net=127.0.0.1,localhost --name cola ./src/main.ts
    ```
 
 2. If Codex is not named `codex`, install with the executable name allowed by Deno and pass
@@ -34,6 +34,6 @@ Install the `cola` command with Deno.
 ## Expectations
 
 - `cola --version` prints `0.1.0`.
-- `cola --help` lists `create`, `worktree`, `repo`, `config`, `alias`, `bd`, and `completions`.
+- `cola --help` lists `create`, `worktree`, `repo`, `server`, `config`, `alias`, and `completions`.
 - The installed command can read and write cola config under `$XDG_CONFIG_HOME/cola` or
   `~/.config/cola`.
